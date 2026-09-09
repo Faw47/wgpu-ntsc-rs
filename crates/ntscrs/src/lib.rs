@@ -3,9 +3,9 @@ mod filter;
 pub mod gpu;
 mod noise;
 mod ntsc;
+#[cfg(feature = "gpu-wgpu")]
 pub(crate) use ntsc::noise_seeds;
 mod random;
-// Empty line instead of the unused import
 pub mod settings;
 mod shift;
 mod thread_pool;
@@ -52,23 +52,45 @@ pub fn apply_effect_to_yiq_with_backend_preference(
     frame_num: usize,
     scale_factor: [f32; 2],
     backend_preference: BackendPreference,
-) {
-    match backend_preference {
-        BackendPreference::Auto | BackendPreference::Cpu => {
-            effect.apply_effect_to_yiq(yiq, frame_num, scale_factor);
-        }
-        _ => {
-            let backend_type = match backend_preference {
-                #[cfg(feature = "gpu-wgpu")]
-                BackendPreference::Wgpu => gpu::BackendType::Wgpu,
-                #[cfg(not(feature = "gpu-wgpu"))]
-                BackendPreference::Wgpu => gpu::BackendType::Cpu,
-                BackendPreference::Cuda => gpu::BackendType::Auto,
-                _ => unreachable!(),
+) -> gpu::BackendType {
+    #[cfg(not(feature = "gpu-wgpu"))]
+    let _ = backend_preference;
+    // A GStreamer worker processes many frames. Keep its GPU device, compiled pipelines,
+    // and frame buffers alive instead of initializing the entire backend for every frame.
+    #[cfg(feature = "gpu-wgpu")]
+    if matches!(
+        backend_preference,
+        BackendPreference::Auto | BackendPreference::Wgpu
+    ) {
+        thread_local! {
+            static REQUESTED: std::cell::Cell<BackendPreference> = const { std::cell::Cell::new(BackendPreference::Auto) };
+            // Construct wgpu before registering this TLS destructor. Its debug lock
+            // tracing also uses TLS and must remain alive while GPU resources drop.
+            static RUNNER: std::cell::RefCell<(BackendPreference, gpu::runner::NtscEffectRunner)> = {
+                let preference = REQUESTED.get();
+                std::cell::RefCell::new((preference, make_runner(preference)))
             };
-
-            let mut runner = gpu::runner::NtscEffectRunner::new(backend_type);
-            runner.apply_effect(yiq, effect, frame_num, scale_factor);
         }
+        fn make_runner(preference: BackendPreference) -> gpu::runner::NtscEffectRunner {
+            let requested = if preference == BackendPreference::Auto {
+                gpu::BackendType::Auto
+            } else {
+                gpu::BackendType::Wgpu
+            };
+            gpu::runner::NtscEffectRunner::new(requested)
+        }
+        REQUESTED.set(backend_preference);
+        return RUNNER.with(|runner| {
+            let mut cached = runner.borrow_mut();
+            if cached.0 != backend_preference {
+                *cached = (backend_preference, make_runner(backend_preference));
+            }
+            let (_, runner) = &mut *cached;
+            runner.apply_effect(yiq, effect, frame_num, scale_factor);
+            runner.last_backend()
+        });
     }
+    // CUDA has no implementation. Explicit CPU and builds without wgpu use the reference.
+    effect.apply_effect_to_yiq(yiq, frame_num, scale_factor);
+    gpu::BackendType::Cpu
 }

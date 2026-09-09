@@ -336,7 +336,7 @@ impl TransferFunction {
         }
 
         // We need to handle some trailing samples; we assume the last sample's value extends past the end of the signal
-        for i in width..width + delay {
+        for i in delay.max(width)..width + delay {
             for j in 0..ROWS {
                 let filt_sample = filter_single_sample(
                     simd,

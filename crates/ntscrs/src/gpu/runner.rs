@@ -44,6 +44,10 @@ impl GpuBackend for CpuBackend {
 
 pub struct NtscEffectRunner {
     backend_type: BackendType,
+    last_backend: BackendType,
+    fallback_reason: Option<&'static str>,
+    #[cfg(feature = "gpu-wgpu")]
+    frames: [Option<crate::gpu::wgpu_backend::WgpuFrame>; 2],
     #[cfg(feature = "gpu-wgpu")]
     wgpu_backend: Option<crate::gpu::wgpu_backend::WgpuBackend>,
 }
@@ -61,8 +65,19 @@ impl NtscEffectRunner {
             #[cfg(feature = "gpu-wgpu")]
             BackendType::Wgpu | BackendType::Auto => {
                 if let Some(backend) = crate::gpu::wgpu_backend::WgpuBackend::new() {
-                    wgpu_backend = Some(backend);
-                    actual_backend = BackendType::Wgpu;
+                    // A software Vulkan adapter executes shaders on the CPU and must not
+                    // be advertised as automatic hardware acceleration. Explicit Wgpu
+                    // remains available for CI shader validation and diagnostics.
+                    if requested_backend != BackendType::Auto
+                        || backend.adapter_info.device_type != wgpu::DeviceType::Cpu
+                    {
+                        eprintln!(
+                            "ntsc-rs: using GPU adapter {} ({:?})",
+                            backend.adapter_info.name, backend.adapter_info.backend
+                        );
+                        wgpu_backend = Some(backend);
+                        actual_backend = BackendType::Wgpu;
+                    }
                 } else {
                     println!("ntsc-rs: Failed to initialize WGPU backend, falling back to CPU.");
                 }
@@ -73,6 +88,10 @@ impl NtscEffectRunner {
 
         Self {
             backend_type: actual_backend,
+            last_backend: BackendType::Cpu,
+            fallback_reason: None,
+            #[cfg(feature = "gpu-wgpu")]
+            frames: [None, None],
             #[cfg(feature = "gpu-wgpu")]
             wgpu_backend,
         }
@@ -82,6 +101,15 @@ impl NtscEffectRunner {
         self.backend_type
     }
 
+    /// Backend that actually rendered the most recent frame, including per-effect fallbacks.
+    pub fn last_backend(&self) -> BackendType {
+        self.last_backend
+    }
+
+    pub fn fallback_reason(&self) -> Option<&'static str> {
+        self.fallback_reason
+    }
+
     pub fn apply_effect(
         &mut self,
         src: &mut YiqView,
@@ -89,29 +117,86 @@ impl NtscEffectRunner {
         frame_num: usize,
         scale_factor: [f32; 2],
     ) {
+        self.last_backend = BackendType::Cpu;
+        self.fallback_reason = None;
         match self.backend_type {
             BackendType::Cpu => {
                 effect.apply_effect_to_yiq(src, frame_num, scale_factor);
             }
             #[cfg(feature = "gpu-wgpu")]
             BackendType::Wgpu => {
-                // WGPU processes one contiguous field buffer; interleaved mode stacks two fields and
-                // requires separate passes (CPU applies the effect twice). Use CPU until GPU supports that.
-                if matches!(
-                    src.field,
-                    YiqField::InterleavedUpper | YiqField::InterleavedLower
-                ) {
-                    effect.apply_effect_to_yiq(src, frame_num, scale_factor);
+                let backend = self.wgpu_backend.as_mut().unwrap();
+                let dimensions = src.dimensions;
+                if src.y.is_empty() {
                     return;
                 }
-                let mut frame = self.wgpu_backend.as_mut().unwrap().upload_frame(src);
-                self.wgpu_backend.as_mut().unwrap().apply_effect(
-                    effect,
-                    &mut frame,
-                    frame_num,
-                    scale_factor,
-                );
-                frame.download(src);
+                let (mut first, mut second, first_num, second_num) = match src.field {
+                    YiqField::InterleavedUpper => {
+                        let (mut upper, mut lower) =
+                            src.split_at_row(YiqField::Upper.num_actual_image_rows(dimensions.1));
+                        if let Some(view) = &mut upper {
+                            view.field = YiqField::Upper;
+                        }
+                        if let Some(view) = &mut lower {
+                            view.field = YiqField::Lower;
+                        }
+                        (upper, lower, frame_num * 2, frame_num * 2 + 1)
+                    }
+                    YiqField::InterleavedLower => {
+                        let (mut lower, mut upper) =
+                            src.split_at_row(YiqField::Lower.num_actual_image_rows(dimensions.1));
+                        if let Some(view) = &mut lower {
+                            view.field = YiqField::Lower;
+                        }
+                        if let Some(view) = &mut upper {
+                            view.field = YiqField::Upper;
+                        }
+                        (lower, upper, frame_num * 2, frame_num * 2 + 1)
+                    }
+                    _ => (
+                        Some(YiqView {
+                            y: src.y,
+                            i: src.i,
+                            q: src.q,
+                            scratch: src.scratch,
+                            dimensions: src.dimensions,
+                            field: src.field,
+                        }),
+                        None,
+                        frame_num,
+                        frame_num,
+                    ),
+                };
+                let mut pending = [None, None];
+                // Submit both fields before waiting for either readback. Each field has
+                // its own buffers; odd heights and the reference field timebase are preserved.
+                for (slot, view, number) in [
+                    (0, first.as_ref(), first_num),
+                    (1, second.as_ref(), second_num),
+                ] {
+                    if let Some(view) = view {
+                        let frame = &mut self.frames[slot];
+                        if frame.as_ref().is_none_or(|frame| {
+                            (frame.width, frame.height) != (view.dimensions.0, view.num_rows())
+                        }) {
+                            *frame = Some(backend.upload_frame(view));
+                        } else {
+                            backend.upload_into(view, frame.as_mut().unwrap());
+                        }
+                        let frame = frame.as_mut().unwrap();
+                        backend.apply_effect(effect, frame, number, scale_factor);
+                        pending[slot] = Some(frame.enqueue_download());
+                    }
+                }
+                for (slot, view) in [(0, first.as_mut()), (1, second.as_mut())] {
+                    if let Some(view) = view {
+                        self.frames[slot]
+                            .as_ref()
+                            .unwrap()
+                            .finish_download(view, pending[slot].take().unwrap());
+                    }
+                }
+                self.last_backend = BackendType::Wgpu;
             }
             BackendType::Auto => unreachable!("Auto should have resolved to a concrete backend"),
         }

@@ -51,7 +51,7 @@ fn get_box_y(index: u32) -> f32 {
     var p2 = cur;
     if (index % width < width - 1u) { p2 = scratch_plane[index + 1u]; }
     var p3 = cur;
-    if (index % width < width - 2u) { p3 = scratch_plane[index + 2u]; }
+    if (index % width + 2u < width) { p3 = scratch_plane[index + 2u]; }
     else if (index % width < width - 1u) { p3 = scratch_plane[index + 1u]; }
 
     return (p0 + cur + p2 + p3) * 0.25;
@@ -78,7 +78,7 @@ fn get_two_line_comb_y(index: u32, width: u32, height: u32) -> f32 {
 }
 
 fn process_chroma(val: f32, shift: u32, index: u32, xi: u32) -> vec2<f32> {
-    let offset = (index + shift + xi) & 3u;
+    let offset = ((index % params.width) + shift + xi) & 3u;
     var i_v = val * select(0.5, 1.0, shift == 0u);
     var q_v = val * select(0.5, 1.0, shift == 0u);
     if (offset == 0u) { i_v *= -1.0; q_v *= 0.0; }
@@ -157,7 +157,7 @@ fn demodulate_notch(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let y_l = select(0.0, get_notch_y(index - 1u), col_idx > 0u);
     let y_r = select(0.0, get_notch_y(index + 1u), col_idx < width - 1u);
 
-    y_plane[index] = y_c;
+
 
     let c_c = y_c - scratch_plane[index];
     let c_l = y_l - select(0.0, scratch_plane[index - 1u], col_idx > 0u);
