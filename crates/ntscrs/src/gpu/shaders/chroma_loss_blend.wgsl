@@ -24,39 +24,6 @@ struct Params {
 }
 @group(1) @binding(0) var<uniform> params: Params;
 
-@compute @workgroup_size(1, 1, 1)
-fn chroma_loss(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    // Only thread 0 executes this, sequentially iterating over height
-    if (global_id.x > 0u) { return; }
-    
-    let width = params.width;
-    let height = arrayLength(&i_plane) / width;
-    
-    let base_h = mix_hash(vec2<u32>(0u, params.seed), vec2<u32>(0u, 7u)); // CHROMA_LOSS
-    let frame_h = mix_hash(base_h, vec2<u32>(0u, params.frame_num));
-    
-    var rng = xoshiro256_seed(frame_h);
-    let intensity = params.noise_frequency;
-    
-    if (intensity <= 0.0) { return; }
-    
-    var row_idx = 0u;
-    loop {
-        let jump = geometric_sample(&rng, intensity);
-        row_idx += jump;
-        
-        if (row_idx >= height) { break; }
-        
-        let row_start = row_idx * width;
-        for (var i = 0u; i < width; i++) {
-            i_plane[row_start + i] = 0.0;
-            q_plane[row_start + i] = 0.0;
-        }
-        
-        row_idx += 1u;
-    }
-}
-
 @compute @workgroup_size(64, 1, 1)
 fn chroma_vert_blend(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // 1 thread per column to sequentially blend vertically

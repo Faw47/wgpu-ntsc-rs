@@ -2,13 +2,13 @@
 goal: Improve GPU performance and achieve logic parity with the CPU NTSC effects implementation
 version: 1.0
 date_created: 2026-03-28
-status: Completed
+status: Superseded
 tags: [refactor, performance, feature, parity, gpu]
 ---
 
 # Introduction
 
-![Status: Completed](https://img.shields.io/badge/status-Completed-brightgreen)
+> Historical plan: the completion marks below were not backed by actual GPU parity or performance tests. They are retained as history, not current status. See [the current GPU audit](../docs/gpu-audit.md).
 
 This implementation plan outlines the steps required to address performance bottlenecks in the `ntsc-rs` GPU backend and bring its behavior into full parity with the reference CPU implementation. The plan focuses on optimizing WGSL shader dispatch granularity, minimizing buffer copying overhead, ensuring non-blocking GPU readbacks, and implementing missing NTSC effects to ensure visual consistency between the CPU and GPU render paths.
 

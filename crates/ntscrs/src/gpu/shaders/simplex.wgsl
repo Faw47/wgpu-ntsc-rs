@@ -28,7 +28,7 @@ fn pcg_3d(v: vec3<u32>) -> vec3<u32> {
 fn gradient_1d(hash: u32) -> f32 {
     let h = hash >> 28u;
     var v = f32((h & 7u) + 1u);
-    if ((h & 8u) != 0u) {
+    if ((h & 8u) == 0u) {
         v = -v;
     }
     return v;

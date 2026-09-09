@@ -1,5 +1,7 @@
 use crate::{settings::standard::NtscEffect, yiq_fielding::YiqView};
 
+#[cfg(feature = "gpu-wgpu")]
+mod prepare;
 pub mod runner;
 #[cfg(feature = "gpu-wgpu")]
 pub mod wgpu_backend;

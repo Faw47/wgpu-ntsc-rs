@@ -17,31 +17,28 @@
 
 This repository is derived from **[ntsc-rs](https://github.com/ntsc-rs/ntsc-rs)**. The original project, its algorithms, and naming remain the work of that upstream team; this fork focuses on GPU acceleration and UI modernization.
 
-### CPU vs. WGPU: A Technical Comparison
+### GPU implementation and validation
 
-To achieve real-time performance at higher resolutions, this fork introduces a **wgpu**-based compute pipeline alongside the original CPU reference.
+The `gpu-wgpu` feature enables Vulkan, Metal, or DX12 compute rendering and is enabled by default in the standalone application and plugin manifests. Automatic selection uses a hardware adapter when available and otherwise uses the CPU reference. Explicit `wgpu` selection also permits software adapters for validation.
 
-| Feature | CPU Pipeline (Reference) | wgpu Pipeline (Accelerated) |
-| :--- | :--- | :--- |
-| **Throughput** | Baseline (Real-time at low res) | **~10x Speedup** (up to 4K real-time) |
-| **Accuracy** | 100% Bit-Perfect Reference | High Fidelity (TOL < 0.002) |
-| **Logic** | Original Rust (SIMD/Rayon) | Parallel Compute Shaders (WGSL) |
-| **Hardware** | Universal (Modern CPU) | Dedicated GPU (Vulkan/Metal/DX12) |
-| **Portability** | High | Medium (Driver Dependent) |
+The effect pipeline now includes the reference filters, demodulation modes, noise, snow, head switching, tracking, VHS processing, and interleaved fields. GPU resources are reused across frames. Rust prepares reference random control data; compute shaders process the image planes.
 
-**Performance.** Processing has been moved onto a **wgpu**-based GPU path. On suitable hardware, throughput can reach **up to about 10 times** that of the original CPU-oriented pipeline. Actual speedups depend on your GPU, resolution, and system load.
+**Validation is bounded, not a universal parity or speed guarantee.** The checked CPU/GPU cases pass an absolute Y/I/Q error threshold of 0.002 on software Vulkan, including full default presets through 4K. These compare against this fork's CPU implementation. Latest upstream uses a different random generator. Hardware GPU performance and cross-driver parity still need measurement; the former 10x speedup claim was not supported by the old benchmark.
 
-**Pipeline Fidelity.** We have achieved near-perfect visual parity with the reference implementation. While some low-level shader math differs slightly from the reference Rust code, the resulting output is mathematically consistent within a very tight tolerance (Luma/Chroma error < 0.002).
+Run the real shader tests and end-to-end YIQ benchmark on the target machine:
 
+```sh
+cargo test -p ntsc-rs --features gpu-wgpu -- --include-ignored
+cargo bench -p ntsc-rs --features gpu-wgpu --bench backend_profile
+```
 
+The benchmark includes control preparation, upload, compute, and readback, checks output parity, and refuses CPU fallback. It excludes device initialization, RGB conversion, and video decoding/encoding. Check the printed adapter name: software Vulkan timings do not establish hardware acceleration.
+
+See [the GPU audit](docs/gpu-audit.md) for implemented changes, validation limits, and remaining optimization work.
 
 ## A Note on Development
 
-**Full Transparency.** While the performance metrics and features here are robust, it is important to be honest about the development process. I don't know a thing about what I did.
-
-ALL of the engineering here—including complex WGSL shader ports, asynchronous readback logic, and even parts of this documentation—was achieved through an iterative, trial-and-error process done entirely by **Large Language Models**. 
-
-The goal was to make it fast, and thanks to the power of modern tools (and the incredible foundation of the upstream project), it actually works.
+This fork has been developed with substantial language-model assistance. Its behavior and performance should be assessed from reproducible tests and measurements.
 
 ## Download and Install
 

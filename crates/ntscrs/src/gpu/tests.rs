@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu-wgpu"))]
 mod tests {
     use crate::{
         gpu::{BackendType, runner::NtscEffectRunner},
@@ -14,8 +14,10 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
+    #[cfg(feature = "gpu-wgpu")]
     #[test]
-    fn test_wgpu_copy_pass() {
+    #[ignore = "requires a compute adapter"]
+    fn default_effect_runs_on_gpu() {
         let width = 4;
         let height = 4;
         let mut pixels: Vec<f32> = vec![0.0; width * height * 4];
@@ -51,8 +53,11 @@ mod tests {
             );
             let mut yiq_view = YiqView::from(&mut yiq);
             let mut wgpu_runner = NtscEffectRunner::new(BackendType::Wgpu);
-            if wgpu_runner.active_backend() == BackendType::Wgpu {
+            assert_eq!(wgpu_runner.active_backend(), BackendType::Wgpu);
+            {
                 wgpu_runner.apply_effect(&mut yiq_view, &effect, 0, [1.0, 1.0]);
+                assert_eq!(wgpu_runner.last_backend(), BackendType::Wgpu);
+                assert!(wgpu_runner.fallback_reason().is_none());
 
                 assert_eq!(yiq_view.dimensions, cpu_yiq_view.dimensions);
                 const TOL: f32 = 2e-3;
@@ -77,6 +82,7 @@ mod tests {
 
     #[cfg(feature = "gpu-wgpu")]
     #[test]
+    #[ignore = "requires a compute adapter"]
     fn interleaved_field_wgpu_runner_matches_cpu_reference() {
         let width = 8;
         let height = 8;
@@ -110,19 +116,22 @@ mod tests {
         );
         let mut runner_view = YiqView::from(&mut runner_yiq);
         let mut wgpu_runner = NtscEffectRunner::new(BackendType::Wgpu);
-        if wgpu_runner.active_backend() == BackendType::Wgpu {
+        assert_eq!(wgpu_runner.active_backend(), BackendType::Wgpu);
+        {
             wgpu_runner.apply_effect(&mut runner_view, &effect, 0, [1.0, 1.0]);
+            assert_eq!(wgpu_runner.last_backend(), BackendType::Wgpu);
+            assert!(wgpu_runner.fallback_reason().is_none());
             assert_eq!(direct_view.y.len(), runner_view.y.len());
             assert!(
-                max_plane_diff(direct_view.y, runner_view.y) < 1e-6,
+                max_plane_diff(direct_view.y, runner_view.y) < 2e-3,
                 "interleaved Y mismatch"
             );
             assert!(
-                max_plane_diff(direct_view.i, runner_view.i) < 1e-6,
+                max_plane_diff(direct_view.i, runner_view.i) < 2e-3,
                 "interleaved I mismatch"
             );
             assert!(
-                max_plane_diff(direct_view.q, runner_view.q) < 1e-6,
+                max_plane_diff(direct_view.q, runner_view.q) < 2e-3,
                 "interleaved Q mismatch"
             );
         }
