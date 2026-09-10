@@ -5,6 +5,18 @@ use crate::{
     settings::standard::NtscEffect,
     yiq_fielding::YiqView,
 };
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameTimings {
+    pub upload: Duration,
+    pub control_preparation: Duration,
+    pub command_encoding: Duration,
+    pub queue_submission: Duration,
+    /// Includes GPU completion, staging-map latency, and copying mapped Y/I/Q into the caller.
+    pub readback_wait_and_copy: Duration,
+    pub total: Duration,
+}
 
 /// The CPU reference implementation wrapper, adhering to the GpuBackend interface
 /// so that the pipeline runner can transparently call it.
@@ -46,6 +58,7 @@ pub struct NtscEffectRunner {
     backend_type: BackendType,
     last_backend: BackendType,
     fallback_reason: Option<&'static str>,
+    last_timings: FrameTimings,
     #[cfg(feature = "gpu-wgpu")]
     frames: [Option<crate::gpu::wgpu_backend::WgpuFrame>; 2],
     #[cfg(feature = "gpu-wgpu")]
@@ -90,6 +103,7 @@ impl NtscEffectRunner {
             backend_type: actual_backend,
             last_backend: BackendType::Cpu,
             fallback_reason: None,
+            last_timings: FrameTimings::default(),
             #[cfg(feature = "gpu-wgpu")]
             frames: [None, None],
             #[cfg(feature = "gpu-wgpu")]
@@ -110,6 +124,10 @@ impl NtscEffectRunner {
         self.fallback_reason
     }
 
+    pub fn last_timings(&self) -> FrameTimings {
+        self.last_timings
+    }
+
     pub fn apply_effect(
         &mut self,
         src: &mut YiqView,
@@ -117,19 +135,24 @@ impl NtscEffectRunner {
         frame_num: usize,
         scale_factor: [f32; 2],
     ) {
+        let total_started = Instant::now();
         self.last_backend = BackendType::Cpu;
         self.fallback_reason = None;
+        self.last_timings = FrameTimings::default();
         match self.backend_type {
             BackendType::Cpu => {
                 effect.apply_effect_to_yiq(src, frame_num, scale_factor);
+                self.last_timings.total = total_started.elapsed();
             }
             #[cfg(feature = "gpu-wgpu")]
             BackendType::Wgpu => {
                 let backend = self.wgpu_backend.as_mut().unwrap();
                 let dimensions = src.dimensions;
                 if src.y.is_empty() {
+                    self.last_timings.total = total_started.elapsed();
                     return;
                 }
+                let mut timings = FrameTimings::default();
                 let (mut first, mut second, first_num, second_num) = match src.field {
                     YiqField::InterleavedUpper => {
                         let (mut upper, mut lower) =
@@ -175,6 +198,7 @@ impl NtscEffectRunner {
                     (1, second.as_ref(), second_num),
                 ] {
                     if let Some(view) = view {
+                        let upload_started = Instant::now();
                         let frame = &mut self.frames[slot];
                         if frame.as_ref().is_none_or(|frame| {
                             (frame.width, frame.height) != (view.dimensions.0, view.num_rows())
@@ -183,19 +207,33 @@ impl NtscEffectRunner {
                         } else {
                             backend.upload_into(view, frame.as_mut().unwrap());
                         }
+                        timings.upload += upload_started.elapsed();
                         let frame = frame.as_mut().unwrap();
-                        backend.apply_effect(effect, frame, number, scale_factor);
-                        pending[slot] = Some(frame.enqueue_download());
+                        pending[slot] = Some(backend.apply_effect_and_enqueue_download(
+                            effect,
+                            frame,
+                            number,
+                            scale_factor,
+                        ));
+                        let host = backend.last_host_timings();
+                        timings.control_preparation += host.control_preparation;
+                        timings.command_encoding += host.command_encoding;
+                        timings.queue_submission += host.queue_submission;
                     }
                 }
+                let readback_started = Instant::now();
+                backend.wait_for_submitted_work();
                 for (slot, view) in [(0, first.as_mut()), (1, second.as_mut())] {
                     if let Some(view) = view {
                         self.frames[slot]
                             .as_ref()
                             .unwrap()
-                            .finish_download(view, pending[slot].take().unwrap());
+                            .finish_download_after_poll(view, pending[slot].take().unwrap());
                     }
                 }
+                timings.readback_wait_and_copy = readback_started.elapsed();
+                timings.total = total_started.elapsed();
+                self.last_timings = timings;
                 self.last_backend = BackendType::Wgpu;
             }
             BackendType::Auto => unreachable!("Auto should have resolved to a concrete backend"),

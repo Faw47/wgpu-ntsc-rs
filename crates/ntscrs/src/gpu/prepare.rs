@@ -5,6 +5,7 @@ use crate::{
     noise_seeds,
     random::{Geometric, Seeder},
     settings::standard::*,
+    thread_pool::{self, ZipChunks, with_thread_pool},
 };
 use fearless_simd::Level;
 use rand::{Rng, RngCore, SeedableRng};
@@ -69,34 +70,34 @@ pub fn noise(
     settings: &FbmNoiseSettings,
 ) -> Vec<Row> {
     let seeder = seeder(seed, frame, tag);
-    (0..rows)
-        .map(|row| {
-            noise_row(
-                &seeder,
-                row,
-                width,
-                settings.frequency / scale,
-                settings.intensity,
-                settings.detail,
-            )
-        })
-        .collect()
+    let mut result = vec![Row::default(); rows];
+    ZipChunks::new([result.as_mut_slice()], 1).par_for_each(|row, [slot]| {
+        slot[0] = noise_row(
+            &seeder,
+            row,
+            width,
+            settings.frequency / scale,
+            settings.intensity,
+            settings.detail,
+        );
+    });
+    result
 }
 
 pub fn phase(seed: i32, frame: usize, rows: usize, intensity: f32) -> Vec<Row> {
     let seed = seeder(seed, frame, noise_seeds::VIDEO_CHROMA_PHASE).finalize::<u64>();
-    (0..rows)
-        .map(|row| {
-            let val = hash_row(seed, row) as f32 / (u64::MAX as f32 + 1.0);
-            let (sin, cos) =
-                (((val - 0.5) * 2.0 * intensity) * std::f32::consts::PI * 2.0).sin_cos();
-            Row {
-                phase: sin,
-                frequency: cos,
-                ..Row::default()
-            }
-        })
-        .collect()
+    let mut result = vec![Row::default(); rows];
+    ZipChunks::new([result.as_mut_slice()], 1).par_for_each(|row, [slot]| {
+        let val = hash_row(seed, row) as f32 / (u64::MAX as f32 + 1.0);
+        let (sin, cos) =
+            (((val - 0.5) * 2.0 * intensity) * std::f32::consts::PI * 2.0).sin_cos();
+        slot[0] = Row {
+            phase: sin,
+            frequency: cos,
+            ..Row::default()
+        };
+    });
+    result
 }
 
 pub fn head(
@@ -124,15 +125,20 @@ pub fn head(
     let start = rows.saturating_sub(affected);
     let cutoff = affected.saturating_sub(rows);
     let seeder = seeder(seed, frame, noise_seeds::HEAD_SWITCHING);
-    for (index, row) in result[start..].iter_mut().enumerate() {
-        let index = affected - (index + cutoff);
+    ZipChunks::new([&mut result[start..]], 1).par_for_each(|local, [slot]| {
+        let row = &mut slot[0];
+        let index = affected - (local + cutoff);
         let shift = settings.horiz_shift * ((index + offset) as f32 / count as f32).powf(1.5);
         row.shift = (shift + seeder.clone().mix(index).finalize::<f32>() - 0.5) * sx;
         row.start = 0;
         if index == affected
             && let Some(mid) = &settings.mid_line
         {
-            let seeder = self::seeder(seed, frame, noise_seeds::HEAD_SWITCHING_MID_LINE_JITTER);
+            let seeder = self::seeder(
+                seed,
+                frame,
+                noise_seeds::HEAD_SWITCHING_MID_LINE_JITTER,
+            );
             let random = (seeder.clone().mix(0).finalize::<f32>()
                 + seeder.clone().mix(1).finalize::<f32>())
                 * 0.5;
@@ -140,7 +146,7 @@ pub fn head(
             row.transient_len = 16.0 * sx;
             row.transient_intensity = (seeder.mix(0).finalize::<f32>() + 0.5) * 0.5;
         }
-    }
+    });
     result
 }
 
@@ -257,6 +263,22 @@ struct Snow {
     events: Vec<[u32; 4]>,
     random: Vec<u32>,
 }
+
+#[derive(Default)]
+struct SnowRow {
+    events: Vec<SnowEvent>,
+    random: Vec<u32>,
+}
+
+struct SnowEvent {
+    start: isize,
+    len: f32,
+    frequency: f32,
+    visible: usize,
+    end: usize,
+    random_start: usize,
+}
+
 impl Snow {
     fn new(width: usize, rows: usize) -> Self {
         Self {
@@ -267,51 +289,26 @@ impl Snow {
         }
     }
     fn row(&mut self, row: usize, seed: u64, intensity: f32, anisotropy: f32, scale: f32) {
-        let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-        let intensity = intensity as f64;
-        let anisotropy = anisotropy as f64;
-        let logistic = ((rng.random::<f64>() - intensity)
-            / (intensity * (1.0 - intensity) * (1.0 - anisotropy)))
-            .exp();
-        let probability = ((anisotropy / (1.0 + logistic) + intensity * (1.0 - anisotropy))
-            * 0.125)
-            .clamp(0.0, 1.0);
-        if probability <= 0.0 {
-            return;
-        }
-        let dist = Geometric::new(probability);
-        let mut start = -64isize;
-        loop {
-            start = start.saturating_add(rng.sample(&dist).min(isize::MAX as usize) as isize);
-            if start >= self.width as isize {
-                break;
+        self.append_row(
+            row,
+            generate_snow_row(self.width, seed, intensity, anisotropy, scale),
+        );
+    }
+    fn append_row(&mut self, row: usize, generated: SnowRow) {
+        let random_base = self.random.len();
+        for event in generated.events {
+            let event_idx = self.events.len() as u32;
+            self.events.push([
+                event.start as i32 as u32,
+                event.len.to_bits(),
+                event.frequency.to_bits(),
+                (random_base + event.random_start) as u32,
+            ]);
+            for tile in event.visible / 32..=(event.end - 1) / 32 {
+                self.tiles[row * self.width.div_ceil(32) + tile].push(event_idx);
             }
-            let len = rng.random_range(8.0..=64.0) * scale;
-            let freq = rng.random_range(len * 3.0..=len * 5.0);
-            let end = start
-                .saturating_add(len.ceil() as isize)
-                .clamp(0, self.width as isize) as usize;
-            rng.jump();
-            let mut event_rng = rng.clone();
-            let visible = start.clamp(0, self.width as isize) as usize;
-            if visible < end {
-                let event = self.events.len() as u32;
-                self.events.push([
-                    start as i32 as u32,
-                    len.to_bits(),
-                    freq.to_bits(),
-                    self.random.len() as u32,
-                ]);
-                for _ in visible..end {
-                    self.random
-                        .push(event_rng.random_range(-1.0f32..2.0).to_bits());
-                }
-                for tile in visible / 32..=(end - 1) / 32 {
-                    self.tiles[row * self.width.div_ceil(32) + tile].push(event);
-                }
-            }
-            start += 1;
         }
+        self.random.extend(generated.random);
     }
     fn finish(self) -> Vec<u32> {
         if self.events.is_empty() {
@@ -333,6 +330,62 @@ impl Snow {
     }
 }
 
+fn generate_snow_row(
+    width: usize,
+    seed: u64,
+    intensity: f32,
+    anisotropy: f32,
+    scale: f32,
+) -> SnowRow {
+    let mut generated = SnowRow::default();
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+    let intensity = intensity as f64;
+    let anisotropy = anisotropy as f64;
+    let logistic = ((rng.random::<f64>() - intensity)
+        / (intensity * (1.0 - intensity) * (1.0 - anisotropy)))
+        .exp();
+    let probability = ((anisotropy / (1.0 + logistic) + intensity * (1.0 - anisotropy))
+        * 0.125)
+        .clamp(0.0, 1.0);
+    if probability <= 0.0 {
+        return generated;
+    }
+    let dist = Geometric::new(probability);
+    let mut start = -64isize;
+    loop {
+        start = start.saturating_add(rng.sample(&dist).min(isize::MAX as usize) as isize);
+        if start >= width as isize {
+            break;
+        }
+        let len = rng.random_range(8.0..=64.0) * scale;
+        let freq = rng.random_range(len * 3.0..=len * 5.0);
+        let end = start
+            .saturating_add(len.ceil() as isize)
+            .clamp(0, width as isize) as usize;
+        rng.jump();
+        let mut event_rng = rng.clone();
+        let visible = start.clamp(0, width as isize) as usize;
+        if visible < end {
+            let random_start = generated.random.len();
+            for _ in visible..end {
+                generated
+                    .random
+                    .push(event_rng.random_range(-1.0f32..2.0).to_bits());
+            }
+            generated.events.push(SnowEvent {
+                start,
+                len,
+                frequency: freq,
+                visible,
+                end,
+                random_start,
+            });
+        }
+        start += 1;
+    }
+    generated
+}
+
 pub fn snow(
     seed: i32,
     frame: usize,
@@ -343,9 +396,272 @@ pub fn snow(
     scale: f32,
 ) -> Vec<u32> {
     let seed = seeder(seed, frame, noise_seeds::SNOW).finalize();
+    let mut generated: Vec<SnowRow> = (0..rows).map(|_| SnowRow::default()).collect();
+    ZipChunks::new([generated.as_mut_slice()], 1).par_for_each(|row, [slot]| {
+        slot[0] = generate_snow_row(
+            width,
+            hash_row(seed, row),
+            intensity,
+            anisotropy,
+            scale,
+        );
+    });
     let mut result = Snow::new(width, rows);
-    for row in 0..rows {
-        result.row(row, hash_row(seed, row), intensity, anisotropy, scale);
+    for (row, generated) in generated.into_iter().enumerate() {
+        result.append_row(row, generated);
     }
     result.finish()
+}
+
+/// All CPU-generated control data for one field. Each stream uses its own reference seed, so
+/// streams can be prepared concurrently without changing RNG advancement or effect ordering.
+#[derive(Default)]
+pub struct Controls {
+    pub composite_noise: Option<Vec<Row>>,
+    pub snow: Option<Vec<u32>>,
+    pub head: Option<Vec<Row>>,
+    pub tracking: Option<(Vec<Row>, Vec<u32>)>,
+    pub luma_noise: Option<Vec<Row>>,
+    pub chroma_noise: Option<(Vec<Row>, Vec<Row>)>,
+    pub phase_noise: Option<Vec<Row>>,
+    pub edge_wave: Option<Vec<Row>>,
+    pub chroma_loss: Option<Vec<Row>>,
+}
+
+pub fn controls(
+    effect: &NtscEffect,
+    frame: usize,
+    width: usize,
+    rows: usize,
+    sx: f32,
+    sy: f32,
+) -> Controls {
+    let vhs = effect.vhs_settings.as_ref();
+    let has_controls = effect.composite_noise.is_some()
+        || (effect.snow_intensity > 0.0 && sx > 0.0)
+        || effect.head_switching.is_some()
+        || effect.tracking_noise.is_some()
+        || effect.luma_noise.is_some()
+        || effect.chroma_noise.is_some()
+        || effect.chroma_phase_noise_intensity > 0.0
+        || vhs
+            .and_then(|settings| settings.edge_wave.as_ref())
+            .is_some_and(|settings| settings.intensity > 0.0)
+        || vhs.is_some_and(|settings| settings.chroma_loss > 0.0);
+    if !has_controls {
+        return Controls::default();
+    }
+
+    with_thread_pool(|| {
+        let ((composite_noise, snow), (head, tracking)) = thread_pool::join(
+            || {
+                thread_pool::join(
+                    || {
+                        effect.composite_noise.as_ref().map(|settings| {
+                            noise(
+                                effect.random_seed,
+                                frame,
+                                noise_seeds::VIDEO_COMPOSITE,
+                                width,
+                                rows,
+                                sx,
+                                settings,
+                            )
+                        })
+                    },
+                    || {
+                        (effect.snow_intensity > 0.0 && sx > 0.0).then(|| {
+                            snow(
+                                effect.random_seed,
+                                frame,
+                                width,
+                                rows,
+                                effect.snow_intensity * 0.01,
+                                effect.snow_anisotropy,
+                                sx,
+                            )
+                        })
+                    },
+                )
+            },
+            || {
+                thread_pool::join(
+                    || {
+                        effect.head_switching.as_ref().map(|settings| {
+                            head(effect.random_seed, frame, width, rows, sx, sy, settings)
+                        })
+                    },
+                    || {
+                        effect.tracking_noise.as_ref().map(|settings| {
+                            tracking(effect.random_seed, frame, width, rows, sx, sy, settings)
+                        })
+                    },
+                )
+            },
+        );
+
+        let ((luma_noise, chroma_noise), (phase_noise, (edge_wave, chroma_loss))) =
+            thread_pool::join(
+                || {
+                    thread_pool::join(
+                        || {
+                            effect.luma_noise.as_ref().map(|settings| {
+                                noise(
+                                    effect.random_seed,
+                                    frame,
+                                    noise_seeds::VIDEO_LUMA,
+                                    width,
+                                    rows,
+                                    sx,
+                                    settings,
+                                )
+                            })
+                        },
+                        || {
+                            effect.chroma_noise.as_ref().map(|settings| {
+                                thread_pool::join(
+                                    || {
+                                        noise(
+                                            effect.random_seed,
+                                            frame,
+                                            noise_seeds::VIDEO_CHROMA_I,
+                                            width,
+                                            rows,
+                                            sx,
+                                            settings,
+                                        )
+                                    },
+                                    || {
+                                        noise(
+                                            effect.random_seed,
+                                            frame,
+                                            noise_seeds::VIDEO_CHROMA_Q,
+                                            width,
+                                            rows,
+                                            sx,
+                                            settings,
+                                        )
+                                    },
+                                )
+                            })
+                        },
+                    )
+                },
+                || {
+                    thread_pool::join(
+                        || {
+                            (effect.chroma_phase_noise_intensity > 0.0).then(|| {
+                                phase(
+                                    effect.random_seed,
+                                    frame,
+                                    rows,
+                                    effect.chroma_phase_noise_intensity,
+                                )
+                            })
+                        },
+                        || {
+                            thread_pool::join(
+                                || {
+                                    effect
+                                        .vhs_settings
+                                        .as_ref()
+                                        .and_then(|vhs| vhs.edge_wave.as_ref())
+                                        .filter(|settings| settings.intensity > 0.0)
+                                        .map(|settings| {
+                                            wave(
+                                                effect.random_seed,
+                                                frame,
+                                                rows,
+                                                sx,
+                                                sy,
+                                                settings,
+                                            )
+                                        })
+                                },
+                                || {
+                                    effect.vhs_settings.as_ref().and_then(|vhs| {
+                                        (vhs.chroma_loss > 0.0).then(|| {
+                                            loss(
+                                                effect.random_seed,
+                                                frame,
+                                                rows,
+                                                vhs.chroma_loss,
+                                            )
+                                        })
+                                    })
+                                },
+                            )
+                        },
+                    )
+                },
+            );
+
+        Controls {
+            composite_noise,
+            snow,
+            head,
+            tracking,
+            luma_noise,
+            chroma_noise,
+            phase_noise,
+            edge_wave,
+            chroma_loss,
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn independent_noise_rows_preserve_serial_control_bytes() {
+        let settings = FbmNoiseSettings {
+            frequency: 0.173,
+            intensity: 0.41,
+            detail: 3,
+        };
+        let seeder = seeder(-47, 13, noise_seeds::VIDEO_LUMA);
+        let expected: Vec<Row> = (0..257)
+            .map(|row| noise_row(&seeder, row, 641, settings.frequency / 1.25, settings.intensity, 3))
+            .collect();
+        let actual = noise(
+            -47,
+            13,
+            noise_seeds::VIDEO_LUMA,
+            641,
+            257,
+            1.25,
+            &settings,
+        );
+        assert_eq!(
+            bytemuck::cast_slice::<Row, u8>(&actual),
+            bytemuck::cast_slice::<Row, u8>(&expected)
+        );
+    }
+
+    #[test]
+    fn parallel_snow_merge_preserves_serial_control_bytes() {
+        for (width, rows, intensity, anisotropy, scale) in [
+            (1, 1, 0.01, 0.0, 1.0),
+            (65, 33, 0.5, 0.5, 1.25),
+            (257, 67, 1.0, 1.0, 0.75),
+        ] {
+            let seed = seeder(-47, 13, noise_seeds::SNOW).finalize();
+            let mut serial = Snow::new(width, rows);
+            for row in 0..rows {
+                serial.row(
+                    row,
+                    hash_row(seed, row),
+                    intensity,
+                    anisotropy,
+                    scale,
+                );
+            }
+            assert_eq!(
+                snow(-47, 13, width, rows, intensity, anisotropy, scale),
+                serial.finish()
+            );
+        }
+    }
 }

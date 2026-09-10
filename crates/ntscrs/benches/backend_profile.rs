@@ -70,6 +70,22 @@ fn criterion_benchmark(c: &mut Criterion) {
                         "benchmark parity gate failed at {resolution}: {a} versus {b}"
                     );
                 }
+
+                // Report a reused-buffer sample separately from Criterion's end-to-end result.
+                // GPU execution is asynchronous, so compute time remains part of the readback wait
+                // unless the adapter supports timestamp-query profiling.
+                actual.copy_from_slice(&input);
+                render(&mut gpu, &mut actual, &effect, width, height);
+                let timings = gpu.last_timings();
+                eprintln!(
+                    "wgpu host stages {name}/{resolution}: upload={:?} control={:?} encode={:?} submit={:?} readback+gpu-wait={:?} total={:?}",
+                    timings.upload,
+                    timings.control_preparation,
+                    timings.command_encoding,
+                    timings.queue_submission,
+                    timings.readback_wait_and_copy,
+                    timings.total,
+                );
             }
             group.bench_with_input(BenchmarkId::new("cpu", &resolution), &input, |b, input| {
                 b.iter_batched_ref(
