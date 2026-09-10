@@ -22,7 +22,13 @@ jobs:
       - name: Install software Vulkan
         run: |
           sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers
+          sudo apt-get install -y \
+            libatk1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgstreamer1.0-dev \
+            libgtk-3-dev \
+            mesa-vulkan-drivers \
+            pkg-config
           ICD=$(find /usr/share/vulkan/icd.d -name 'lvp*.json' -print -quit)
           test -n "$ICD"
           echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
@@ -30,3 +36,5 @@ jobs:
         run: cargo +1.90.0 test -p ntsc-rs --no-default-features
       - name: Execute GPU shaders and compare to reference
         run: cargo +1.90.0 test -p ntsc-rs --features gpu-wgpu -- --include-ignored
+      - name: Check shipped GUI and CLI WGPU path
+        run: cargo +1.90.0 check -p ntsc-rs-gui --features gpu-wgpu
