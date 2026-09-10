@@ -23,7 +23,7 @@ The `gpu-wgpu` feature enables Vulkan, Metal, or DX12 compute rendering and is e
 
 The effect pipeline now includes the reference filters, demodulation modes, noise, snow, head switching, tracking, VHS processing, and interleaved fields. GPU resources are reused across frames. Rust prepares reference random control data; compute shaders process the image planes.
 
-**Validation is bounded, not a universal parity or speed guarantee.** The checked CPU/GPU cases pass an absolute Y/I/Q error threshold of 0.002 on software Vulkan, including full default presets through 4K. These compare against this fork's CPU implementation. Latest upstream uses a different random generator. Hardware GPU performance and cross-driver parity still need measurement; the former 10x speedup claim was not supported by the old benchmark.
+**Validation is bounded, not a universal parity or speed guarantee.** The CPU reference now follows pinned current-upstream SplitMix64/Mix4 randomness and proxy-scaling semantics, with fixed-seed regression coverage. The adapter-backed CPU/GPU suite retains an absolute Y/I/Q error threshold of 0.002, but hardware GPU performance and cross-driver parity still require measurement; the former 10x speedup claim was not supported by the old benchmark. See `GPU_PORT_SPEC.md` for the exact verified and hardware-gated scope.
 
 Run the real shader tests and end-to-end YIQ benchmark on the target machine:
 

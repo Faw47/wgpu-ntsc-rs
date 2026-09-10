@@ -127,14 +127,18 @@ fn demodulate_box(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let xi = chroma_phase_shift(row_idx * 2u, params.frame_num, params.phase_shift, params.phase_offset);
 
     let y_c = get_box_y(index);
-    let y_l = select(0.0, get_box_y(index - 1u), col_idx > 0u);
-    let y_r = select(0.0, get_box_y(index + 1u), col_idx < width - 1u);
+    var c_l = 0.0;
+    var c_r = 0.0;
+    if (col_idx > 0u) {
+        c_l = get_box_y(index - 1u) - scratch_plane[index - 1u];
+    }
+    if (col_idx + 1u < width) {
+        c_r = get_box_y(index + 1u) - scratch_plane[index + 1u];
+    }
 
     y_plane[index] = y_c;
 
     let c_c = y_c - scratch_plane[index];
-    let c_l = y_l - select(0.0, scratch_plane[index - 1u], col_idx > 0u);
-    let c_r = y_r - select(0.0, scratch_plane[index + 1u], col_idx < width - 1u);
 
     apply_chroma(index, xi, c_c, c_l, c_r);
 }
@@ -154,14 +158,16 @@ fn demodulate_notch(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let xi = chroma_phase_shift(row_idx * 2u, params.frame_num, params.phase_shift, params.phase_offset);
 
     let y_c = get_notch_y(index);
-    let y_l = select(0.0, get_notch_y(index - 1u), col_idx > 0u);
-    let y_r = select(0.0, get_notch_y(index + 1u), col_idx < width - 1u);
-
-
+    var c_l = 0.0;
+    var c_r = 0.0;
+    if (col_idx > 0u) {
+        c_l = get_notch_y(index - 1u) - scratch_plane[index - 1u];
+    }
+    if (col_idx + 1u < width) {
+        c_r = get_notch_y(index + 1u) - scratch_plane[index + 1u];
+    }
 
     let c_c = y_c - scratch_plane[index];
-    let c_l = y_l - select(0.0, scratch_plane[index - 1u], col_idx > 0u);
-    let c_r = y_r - select(0.0, scratch_plane[index + 1u], col_idx < width - 1u);
 
     apply_chroma(index, xi, c_c, c_l, c_r);
 }
@@ -181,14 +187,18 @@ fn demodulate_one_line_comb(@builtin(global_invocation_id) global_id: vec3<u32>)
     let xi = chroma_phase_shift(row_idx * 2u, params.frame_num, params.phase_shift, params.phase_offset);
 
     let y_c = get_one_line_comb_y(index, width);
-    let y_l = select(0.0, get_one_line_comb_y(index - 1u, width), col_idx > 0u);
-    let y_r = select(0.0, get_one_line_comb_y(index + 1u, width), col_idx < width - 1u);
+    var c_l = 0.0;
+    var c_r = 0.0;
+    if (col_idx > 0u) {
+        c_l = get_one_line_comb_y(index - 1u, width) - scratch_plane[index - 1u];
+    }
+    if (col_idx + 1u < width) {
+        c_r = get_one_line_comb_y(index + 1u, width) - scratch_plane[index + 1u];
+    }
 
     y_plane[index] = y_c;
 
     let c_c = y_c - scratch_plane[index];
-    let c_l = y_l - select(0.0, scratch_plane[index - 1u], col_idx > 0u);
-    let c_r = y_r - select(0.0, scratch_plane[index + 1u], col_idx < width - 1u);
 
     apply_chroma(index, xi, c_c, c_l, c_r);
 }
@@ -208,14 +218,18 @@ fn demodulate_two_line_comb(@builtin(global_invocation_id) global_id: vec3<u32>)
     let xi = chroma_phase_shift(row_idx * 2u, params.frame_num, params.phase_shift, params.phase_offset);
 
     let y_c = get_two_line_comb_y(index, width, height);
-    let y_l = select(0.0, get_two_line_comb_y(index - 1u, width, height), col_idx > 0u);
-    let y_r = select(0.0, get_two_line_comb_y(index + 1u, width, height), col_idx < width - 1u);
+    var c_l = 0.0;
+    var c_r = 0.0;
+    if (col_idx > 0u) {
+        c_l = get_two_line_comb_y(index - 1u, width, height) - scratch_plane[index - 1u];
+    }
+    if (col_idx + 1u < width) {
+        c_r = get_two_line_comb_y(index + 1u, width, height) - scratch_plane[index + 1u];
+    }
 
     y_plane[index] = y_c;
 
     let c_c = y_c - scratch_plane[index];
-    let c_l = y_l - select(0.0, scratch_plane[index - 1u], col_idx > 0u);
-    let c_r = y_r - select(0.0, scratch_plane[index + 1u], col_idx < width - 1u);
 
     apply_chroma(index, xi, c_c, c_l, c_r);
 }

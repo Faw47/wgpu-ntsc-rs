@@ -126,7 +126,7 @@ Statuses deliberately distinguish implementation and static review from runtime 
 | 7 | Top-level snow | `CPU_CONTROL_GPU_PIXEL_RUNTIME_GATED` | CPU event order, geometric walk, event substreams and tile binning inspected; WGSL evaluates overlapping events in reference order; dense case exists. |
 | 8 | Head switching | `CPU_CONTROL_GPU_PIXEL_RUNTIME_GATED` | Row and mid-line seed streams, shift interpolation, zero boundary, partial-row copy, transient envelope inspected; isolated case exists. |
 | 9 | Tracking noise | `CPU_CONTROL_GPU_PIXEL_RUNTIME_GATED` | Initial RNG draws, row-derived noise/snow, intensity ramp, shared event merge, shifts and three dispatches inspected; isolated case exists. |
-| 10 | Luma-to-chroma demodulation | `STATIC_MATCH_RUNTIME_GATED` | Box/Notch/one-line/two-line equations, first/last-line reflection, horizontal neighbors, carrier phase and one-row override inspected; all modes and tiny/odd dimensions covered. |
+| 10 | Luma-to-chroma demodulation | `STATIC_MATCH_RUNTIME_GATED` | Box/Notch/one-line/two-line equations, first/last-line reflection, horizontal neighbors, carrier phase and one-row override inspected; all modes and tiny/odd dimensions covered. Edge-neighbor storage reads now use control-flow guards because WGSL `select` evaluates both value operands and did not make the previous out-of-range load expressions safe. |
 | 11 | Luma smear | `STATIC_MATCH_RUNTIME_GATED` | Low-pass construction and recursive WGSL application inspected; isolated case exists. |
 | 12 | Ringing | `STATIC_MATCH_RUNTIME_GATED` | Band-pass construction, scaling, initial state and recursive application inspected; isolated case exists. |
 | 13 | Luma noise | `CPU_CONTROL_GPU_PIXEL_RUNTIME_GATED` | Same verified row control and FBM path as stage 6 with tag 10. |
@@ -221,7 +221,8 @@ Completed source-justified work:
 4. Safe noise and phase row preparation parallelized in the configured pool with exact sequential-reference tests.
 5. Fixed-seed fixtures added for every stochastic control path and the full pinned-upstream default stack.
 6. WGSL parse/validation, proxy-scale WGPU, Alternating parity, adapter/fallback, and command-submission proof tests added.
-7. Obsolete Xoshiro/Murmur shader source removed.
+7. Speculative out-of-bounds demodulation neighbor loads replaced with explicit edge guards.
+8. Obsolete Xoshiro/Murmur shader source removed.
 
 Still runtime-gated:
 
@@ -329,7 +330,7 @@ Completed in this pass:
 - preview YIQ/RGB/GStreamer/eguisink ownership traced;
 - Rust tests and adapter-independent shader validation executed.
 
-Static review plus tests found and fixed four material defects: proxy scale loss, obsolete RNG semantics, obsolete simplex SIMD behavior including the WGSL 1D gradient sign, and missing fallback/submission observability. Runtime WGPU equivalence remains explicitly unclaimed until an adapter runs the ignored suite.
+Static review plus tests found and fixed five material parity, safety, or observability defects: proxy scale loss, obsolete RNG semantics, obsolete simplex SIMD behavior including the WGSL 1D gradient sign, speculative edge-lane demodulation reads, and missing fallback/submission observability. Runtime WGPU equivalence remains explicitly unclaimed until an adapter runs the ignored suite.
 
 ## Handoff Contract
 
