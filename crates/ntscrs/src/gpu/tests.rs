@@ -6,6 +6,15 @@ mod tests {
         yiq_fielding::{Rgbx, YiqField, YiqOwned, YiqView},
     };
 
+    #[test]
+    fn wgpu_backends_share_immutable_device_context() {
+        let Some(first) = crate::gpu::wgpu_backend::WgpuBackend::new() else {
+            return;
+        };
+        let second = crate::gpu::wgpu_backend::WgpuBackend::new().unwrap();
+        assert!(first.shares_device_with(&second));
+    }
+
     #[cfg(feature = "gpu-wgpu")]
     fn max_plane_diff(a: &[f32], b: &[f32]) -> f32 {
         a.iter()

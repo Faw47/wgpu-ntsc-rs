@@ -82,11 +82,12 @@ impl NtscEffectRunner {
                     // be advertised as automatic hardware acceleration. Explicit Wgpu
                     // remains available for CI shader validation and diagnostics.
                     if requested_backend != BackendType::Auto
-                        || backend.adapter_info.device_type != wgpu::DeviceType::Cpu
+                        || backend.adapter_info().device_type != wgpu::DeviceType::Cpu
                     {
                         eprintln!(
                             "ntsc-rs: using GPU adapter {} ({:?})",
-                            backend.adapter_info.name, backend.adapter_info.backend
+                            backend.adapter_info().name,
+                            backend.adapter_info().backend
                         );
                         wgpu_backend = Some(backend);
                         actual_backend = BackendType::Wgpu;
@@ -222,7 +223,8 @@ impl NtscEffectRunner {
                     }
                 }
                 let readback_started = Instant::now();
-                backend.wait_for_submitted_work();
+                let last_pending = pending[1].as_ref().or(pending[0].as_ref()).unwrap();
+                backend.wait_for_submitted_work(last_pending);
                 for (slot, view) in [(0, first.as_mut()), (1, second.as_mut())] {
                     if let Some(view) = view {
                         self.frames[slot]

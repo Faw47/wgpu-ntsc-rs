@@ -5,7 +5,9 @@ use crate::{
 };
 
 use std::{
+    ops::Deref,
     sync::Arc,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 use wgpu::util::DeviceExt;
@@ -44,6 +46,31 @@ pub struct ShaderParams {
     pub _pad5: u32,
 }
 
+fn empty_shader_params() -> ShaderParams {
+    ShaderParams {
+        width: 0,
+        frame_num: 0,
+        seed: 0,
+        noise_idx: 0,
+        noise_frequency: 0.0,
+        noise_intensity: 0.0,
+        noise_detail: 0,
+        snow_anisotropy: 0.0,
+        phase_shift: 0,
+        phase_offset: 0,
+        filter_mode: 0,
+        chroma_delay_horizontal: 0.0,
+        chroma_delay_vertical: 0,
+        horizontal_scale: 1.0,
+        vertical_scale: 1.0,
+        _pad1: 0,
+        _pad2: 0,
+        _pad3: 0,
+        _pad4: 0,
+        _pad5: 0,
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FilterCoeffs {
@@ -76,6 +103,7 @@ pub struct WgpuFrame {
 
 pub struct PendingReadback {
     receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    submission_index: wgpu::SubmissionIndex,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -99,14 +127,17 @@ impl WgpuFrame {
         encoder.copy_buffer_to_buffer(&self.q_buffer, 0, &self.staging_buffer, size * 2, size);
     }
 
-    fn map_download(&self) -> PendingReadback {
+    fn map_download(&self, submission_index: wgpu::SubmissionIndex) -> PendingReadback {
         let buffer_slice = self.staging_buffer.slice(..);
         let (sender, receiver) = std::sync::mpsc::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
             let _ = sender.send(v);
         });
 
-        PendingReadback { receiver }
+        PendingReadback {
+            receiver,
+            submission_index,
+        }
     }
 
     /// Schedule a standalone readback without waiting. The application runner normally uses
@@ -118,8 +149,8 @@ impl WgpuFrame {
                 label: Some("download encoder"),
             });
         self.encode_download(&mut encoder);
-        self.queue.submit(Some(encoder.finish()));
-        self.map_download()
+        let submission_index = self.queue.submit(Some(encoder.finish()));
+        self.map_download(submission_index)
     }
 
     pub fn finish_download(&self, dst: &mut YiqView, pending: PendingReadback) {
@@ -128,7 +159,10 @@ impl WgpuFrame {
             (dst.dimensions.0, dst.num_rows())
         );
         self.device
-            .poll(wgpu::PollType::wait_indefinitely())
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(pending.submission_index.clone()),
+                timeout: None,
+            })
             .expect("GPU readback poll failed");
         self.finish_download_after_poll(dst, pending);
     }
@@ -166,10 +200,12 @@ impl WgpuFrame {
     }
 }
 
-pub struct WgpuBackend {
+#[doc(hidden)]
+pub struct WgpuShared {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     copy_bind_group_layout: wgpu::BindGroupLayout,
+    params_bind_group_layout: wgpu::BindGroupLayout,
     chroma_into_luma_pipeline: wgpu::ComputePipeline,
     luma_into_chroma_box_pipeline: wgpu::ComputePipeline,
     luma_into_chroma_notch_pipeline: wgpu::ComputePipeline,
@@ -181,14 +217,26 @@ pub struct WgpuBackend {
     filter_plane_pipeline: wgpu::ComputePipeline,
     chroma_vert_blend_pipeline: wgpu::ComputePipeline,
     filter_coeffs_bind_group_layout: wgpu::BindGroupLayout,
-    params_ring_buffer: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     row_layout: wgpu::BindGroupLayout,
     row_pipelines: std::collections::HashMap<&'static str, wgpu::ComputePipeline>,
+    adapter_info: wgpu::AdapterInfo,
+}
+
+pub struct WgpuBackend {
+    shared: Arc<WgpuShared>,
+    params_ring_buffer: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     data_cache: std::cell::RefCell<Vec<(wgpu::Buffer, wgpu::BindGroup, u64)>>,
     data_index: std::cell::Cell<usize>,
     filter_cache: std::cell::RefCell<std::collections::HashMap<[u32; 16], wgpu::BindGroup>>,
     last_host_timings: std::cell::Cell<WgpuHostTimings>,
-    pub adapter_info: wgpu::AdapterInfo,
+}
+
+impl Deref for WgpuBackend {
+    type Target = WgpuShared;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
 }
 
 impl WgpuBackend {
@@ -208,17 +256,52 @@ impl WgpuBackend {
     }
 
     pub fn new() -> Option<Self> {
-        // Pollster block_on is needed to initialize async wgpu structs synchronously
-        pollster::block_on(Self::init_async())
+        static SHARED: OnceLock<Option<Arc<WgpuShared>>> = OnceLock::new();
+        let shared = SHARED
+            .get_or_init(|| pollster::block_on(Self::init_shared()))
+            .clone()?;
+
+        let params = empty_shader_params();
+        let mut params_ring_buffer = Vec::with_capacity(PARAM_SLOTS_PER_SUBMISSION);
+        for _ in 0..PARAM_SLOTS_PER_SUBMISSION {
+            let buffer = shared
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("shader params buffer"),
+                    contents: bytemuck::cast_slice(&[params]),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
+            let bind_group = shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("params bind group"),
+                layout: &shared.params_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            params_ring_buffer.push((buffer, bind_group));
+        }
+
+        Some(Self {
+            shared,
+            params_ring_buffer,
+            data_cache: Default::default(),
+            data_index: Default::default(),
+            filter_cache: Default::default(),
+            last_host_timings: Default::default(),
+        })
     }
 
-    pub(crate) fn wait_for_submitted_work(&self) {
+    pub(crate) fn wait_for_submitted_work(&self, pending: &PendingReadback) {
         self.device
-            .poll(wgpu::PollType::wait_indefinitely())
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(pending.submission_index.clone()),
+                timeout: None,
+            })
             .expect("GPU readback poll failed");
     }
 
-    async fn init_async() -> Option<Self> {
+    async fn init_shared() -> Option<Arc<WgpuShared>> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
@@ -512,54 +595,11 @@ impl WgpuBackend {
                 cache: None,
             });
 
-        let params = ShaderParams {
-            width: 0,
-            frame_num: 0,
-            seed: 0,
-            noise_idx: 0,
-
-            noise_frequency: 0.0,
-            noise_intensity: 0.0,
-            noise_detail: 0,
-            snow_anisotropy: 0.0,
-
-            phase_shift: 0,
-            phase_offset: 0,
-            filter_mode: 0,
-            chroma_delay_horizontal: 0.0,
-
-            chroma_delay_vertical: 0,
-            horizontal_scale: 1.0,
-            vertical_scale: 1.0,
-            _pad1: 0,
-            _pad2: 0,
-            _pad3: 0,
-            _pad4: 0,
-            _pad5: 0,
-        };
-
-        let mut params_ring_buffer = Vec::with_capacity(PARAM_SLOTS_PER_SUBMISSION);
-        for _ in 0..PARAM_SLOTS_PER_SUBMISSION {
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("shader params buffer"),
-                contents: bytemuck::cast_slice(&[params]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("params bind group"),
-                layout: &params_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffer.as_entire_binding(),
-                }],
-            });
-            params_ring_buffer.push((buffer, bind_group));
-        }
-
-        Some(Self {
+        Some(Arc::new(WgpuShared {
             device: Arc::new(device),
             queue: Arc::new(queue),
             copy_bind_group_layout,
+            params_bind_group_layout,
             chroma_into_luma_pipeline,
             luma_into_chroma_box_pipeline,
             luma_into_chroma_notch_pipeline,
@@ -571,15 +611,10 @@ impl WgpuBackend {
             filter_plane_pipeline,
             chroma_vert_blend_pipeline,
             filter_coeffs_bind_group_layout,
-            params_ring_buffer,
             row_layout,
             row_pipelines,
-            data_cache: Default::default(),
-            data_index: Default::default(),
-            filter_cache: Default::default(),
-            last_host_timings: Default::default(),
             adapter_info: adapter.get_info(),
-        })
+        }))
     }
 
     fn dispatch_filter_plane<'a>(
@@ -926,15 +961,24 @@ impl WgpuBackend {
         let mut encoder = self.encode_effect(effect, frame, frame_num, scale_factor);
         frame.encode_download(&mut encoder);
         let submit_started = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
+        let submission_index = self.queue.submit(Some(encoder.finish()));
         let mut timings = self.last_host_timings.get();
         timings.queue_submission = submit_started.elapsed();
         self.last_host_timings.set(timings);
-        frame.map_download()
+        frame.map_download(submission_index)
     }
 
     pub fn last_host_timings(&self) -> WgpuHostTimings {
         self.last_host_timings.get()
+    }
+
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        &self.adapter_info
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_device_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
     }
 
     fn encode_effect(
