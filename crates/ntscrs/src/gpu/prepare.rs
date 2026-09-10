@@ -453,148 +453,171 @@ pub fn controls(
     }
 
     with_thread_pool(|| {
-        let ((composite_noise, snow), (head, tracking)) = thread_pool::join(
+        let (
+            ((composite_noise, snow), (head, tracking)),
+            ((luma_noise, chroma_noise), (phase_noise, (edge_wave, chroma_loss))),
+        ) = thread_pool::join(
             || {
                 thread_pool::join(
                     || {
-                        effect.composite_noise.as_ref().map(|settings| {
-                            noise(
-                                effect.random_seed,
-                                frame,
-                                noise_seeds::VIDEO_COMPOSITE,
-                                width,
-                                rows,
-                                sx,
-                                settings,
-                            )
-                        })
+                        thread_pool::join(
+                            || {
+                                effect.composite_noise.as_ref().map(|settings| {
+                                    noise(
+                                        effect.random_seed,
+                                        frame,
+                                        noise_seeds::VIDEO_COMPOSITE,
+                                        width,
+                                        rows,
+                                        sx,
+                                        settings,
+                                    )
+                                })
+                            },
+                            || {
+                                (effect.snow_intensity > 0.0 && sx > 0.0).then(|| {
+                                    snow(
+                                        effect.random_seed,
+                                        frame,
+                                        width,
+                                        rows,
+                                        effect.snow_intensity * 0.01,
+                                        effect.snow_anisotropy,
+                                        sx,
+                                    )
+                                })
+                            },
+                        )
                     },
                     || {
-                        (effect.snow_intensity > 0.0 && sx > 0.0).then(|| {
-                            snow(
-                                effect.random_seed,
-                                frame,
-                                width,
-                                rows,
-                                effect.snow_intensity * 0.01,
-                                effect.snow_anisotropy,
-                                sx,
-                            )
-                        })
+                        thread_pool::join(
+                            || {
+                                effect.head_switching.as_ref().map(|settings| {
+                                    head(
+                                        effect.random_seed,
+                                        frame,
+                                        width,
+                                        rows,
+                                        sx,
+                                        sy,
+                                        settings,
+                                    )
+                                })
+                            },
+                            || {
+                                effect.tracking_noise.as_ref().map(|settings| {
+                                    tracking(
+                                        effect.random_seed,
+                                        frame,
+                                        width,
+                                        rows,
+                                        sx,
+                                        sy,
+                                        settings,
+                                    )
+                                })
+                            },
+                        )
                     },
                 )
             },
             || {
                 thread_pool::join(
                     || {
-                        effect.head_switching.as_ref().map(|settings| {
-                            head(effect.random_seed, frame, width, rows, sx, sy, settings)
-                        })
+                        thread_pool::join(
+                            || {
+                                effect.luma_noise.as_ref().map(|settings| {
+                                    noise(
+                                        effect.random_seed,
+                                        frame,
+                                        noise_seeds::VIDEO_LUMA,
+                                        width,
+                                        rows,
+                                        sx,
+                                        settings,
+                                    )
+                                })
+                            },
+                            || {
+                                effect.chroma_noise.as_ref().map(|settings| {
+                                    thread_pool::join(
+                                        || {
+                                            noise(
+                                                effect.random_seed,
+                                                frame,
+                                                noise_seeds::VIDEO_CHROMA_I,
+                                                width,
+                                                rows,
+                                                sx,
+                                                settings,
+                                            )
+                                        },
+                                        || {
+                                            noise(
+                                                effect.random_seed,
+                                                frame,
+                                                noise_seeds::VIDEO_CHROMA_Q,
+                                                width,
+                                                rows,
+                                                sx,
+                                                settings,
+                                            )
+                                        },
+                                    )
+                                })
+                            },
+                        )
                     },
                     || {
-                        effect.tracking_noise.as_ref().map(|settings| {
-                            tracking(effect.random_seed, frame, width, rows, sx, sy, settings)
-                        })
+                        thread_pool::join(
+                            || {
+                                (effect.chroma_phase_noise_intensity > 0.0).then(|| {
+                                    phase(
+                                        effect.random_seed,
+                                        frame,
+                                        rows,
+                                        effect.chroma_phase_noise_intensity,
+                                    )
+                                })
+                            },
+                            || {
+                                thread_pool::join(
+                                    || {
+                                        effect
+                                            .vhs_settings
+                                            .as_ref()
+                                            .and_then(|vhs| vhs.edge_wave.as_ref())
+                                            .filter(|settings| settings.intensity > 0.0)
+                                            .map(|settings| {
+                                                wave(
+                                                    effect.random_seed,
+                                                    frame,
+                                                    rows,
+                                                    sx,
+                                                    sy,
+                                                    settings,
+                                                )
+                                            })
+                                    },
+                                    || {
+                                        effect.vhs_settings.as_ref().and_then(|vhs| {
+                                            (vhs.chroma_loss > 0.0).then(|| {
+                                                loss(
+                                                    effect.random_seed,
+                                                    frame,
+                                                    rows,
+                                                    vhs.chroma_loss,
+                                                )
+                                            })
+                                        })
+                                    },
+                                )
+                            },
+                        )
                     },
                 )
             },
         );
-
-        let ((luma_noise, chroma_noise), (phase_noise, (edge_wave, chroma_loss))) =
-            thread_pool::join(
-                || {
-                    thread_pool::join(
-                        || {
-                            effect.luma_noise.as_ref().map(|settings| {
-                                noise(
-                                    effect.random_seed,
-                                    frame,
-                                    noise_seeds::VIDEO_LUMA,
-                                    width,
-                                    rows,
-                                    sx,
-                                    settings,
-                                )
-                            })
-                        },
-                        || {
-                            effect.chroma_noise.as_ref().map(|settings| {
-                                thread_pool::join(
-                                    || {
-                                        noise(
-                                            effect.random_seed,
-                                            frame,
-                                            noise_seeds::VIDEO_CHROMA_I,
-                                            width,
-                                            rows,
-                                            sx,
-                                            settings,
-                                        )
-                                    },
-                                    || {
-                                        noise(
-                                            effect.random_seed,
-                                            frame,
-                                            noise_seeds::VIDEO_CHROMA_Q,
-                                            width,
-                                            rows,
-                                            sx,
-                                            settings,
-                                        )
-                                    },
-                                )
-                            })
-                        },
-                    )
-                },
-                || {
-                    thread_pool::join(
-                        || {
-                            (effect.chroma_phase_noise_intensity > 0.0).then(|| {
-                                phase(
-                                    effect.random_seed,
-                                    frame,
-                                    rows,
-                                    effect.chroma_phase_noise_intensity,
-                                )
-                            })
-                        },
-                        || {
-                            thread_pool::join(
-                                || {
-                                    effect
-                                        .vhs_settings
-                                        .as_ref()
-                                        .and_then(|vhs| vhs.edge_wave.as_ref())
-                                        .filter(|settings| settings.intensity > 0.0)
-                                        .map(|settings| {
-                                            wave(
-                                                effect.random_seed,
-                                                frame,
-                                                rows,
-                                                sx,
-                                                sy,
-                                                settings,
-                                            )
-                                        })
-                                },
-                                || {
-                                    effect.vhs_settings.as_ref().and_then(|vhs| {
-                                        (vhs.chroma_loss > 0.0).then(|| {
-                                            loss(
-                                                effect.random_seed,
-                                                frame,
-                                                rows,
-                                                vhs.chroma_loss,
-                                            )
-                                        })
-                                    })
-                                },
-                            )
-                        },
-                    )
-                },
-            );
 
         Controls {
             composite_noise,
