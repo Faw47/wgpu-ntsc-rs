@@ -36,5 +36,7 @@ jobs:
         run: cargo +1.90.0 test -p ntsc-rs --no-default-features
       - name: Execute GPU shaders and compare to reference
         run: cargo +1.90.0 test -p ntsc-rs --features gpu-wgpu -- --include-ignored
+      - name: Smoke-test parity-gated benchmark
+        run: cargo +1.90.0 bench -p ntsc-rs --features gpu-wgpu --bench backend_profile -- --test
       - name: Check shipped GUI and CLI WGPU path
         run: cargo +1.90.0 check -p ntsc-rs-gui --features gpu-wgpu
