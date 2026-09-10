@@ -46,23 +46,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var i_val = i_plane[idx];
     var q_val = q_plane[idx];
 
-    // noise_frequency = chroma_phase_error (normalized); noise_intensity = chroma_phase_noise_intensity.
-    var total_angle = params.noise_frequency * TAU;
-
-    if (params.noise_intensity > 0.0) {
-        let seed_val = vec2<u32>(params.seed, params.noise_idx);
-        var h = u64_add(seed_val, vec2<u32>(0u, row_idx));
-        h = u64_xor(h, u64_shr(h, 33u));
-        h = u64_mul(h, vec2<u32>(0xff51afd7u, 0xed558ccdu));
-        h = u64_xor(h, u64_shr(h, 33u));
-        h = u64_mul(h, vec2<u32>(0xc4ceb9feu, 0x1a85ec53u));
-        h = u64_xor(h, u64_shr(h, 33u));
-
-        let val = f32(h.y) / 4294967296.0;
-        // Same as ntsc.rs chroma_phase_noise -> chroma_phase_offset_line (× 2π).
-        let phase_noise = (val * 2.0 - 1.0) * params.noise_intensity * TAU;
-        total_angle += phase_noise;
-    }
+    // Stochastic phase noise uses CPU-prepared upstream SplitMix64 row controls.
+    let total_angle = params.noise_frequency * TAU;
 
     if (total_angle != 0.0) {
         let sin_p = sin(total_angle);

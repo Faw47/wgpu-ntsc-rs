@@ -40,3 +40,23 @@ fn explicit_cpu_and_unimplemented_cuda_preserve_cpu_output() {
         assert_eq!(actual, expected);
     }
 }
+
+#[cfg(feature = "gpu-wgpu")]
+#[test]
+fn explicit_wgpu_selection_reports_adapter_or_fallback_reason() {
+    use ntsc_rs::gpu::{BackendType, runner::NtscEffectRunner};
+
+    let runner = NtscEffectRunner::new(BackendType::Wgpu);
+    assert_eq!(runner.requested_backend(), BackendType::Wgpu);
+    match runner.active_backend() {
+        BackendType::Wgpu => {
+            assert!(runner.fallback_reason().is_none());
+            assert!(runner.wgpu_adapter_info().is_some());
+        }
+        BackendType::Cpu => {
+            assert!(runner.fallback_reason().is_some());
+            assert!(runner.wgpu_adapter_info().is_none());
+        }
+        BackendType::Auto => panic!("Auto must resolve to a concrete backend"),
+    }
+}

@@ -418,3 +418,55 @@ impl std::ops::Mul<&TransferFunction> for &TransferFunction {
         TransferFunction::new(num, den)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scalar_reference(
+        filter: &TransferFunction,
+        input: &[f32],
+        initial: f32,
+        delay: usize,
+    ) -> Vec<f32> {
+        let (num, den) = filter.num_den();
+        let mut output = input.to_vec();
+        if output.is_empty() {
+            return output;
+        }
+        let mut z = vec![0.0; filter.len()];
+        filter.initial_condition_into(initial, &mut z);
+        for index in 0..input.len() + delay {
+            let sample = input[index.min(input.len() - 1)];
+            let filtered = TransferFunction::filter_sample(filter.len(), num, den, &mut z, sample);
+            if index >= delay {
+                output[index - delay] = filtered;
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn delayed_filter_matches_scalar_when_delay_reaches_or_exceeds_width() {
+        let filter = TransferFunction::new(&[0.2, 0.5, 0.3], &[-0.3, 0.1]);
+        for (width, delay) in [(1, 1), (1, 10), (2, 5), (3, 8), (10, 10)] {
+            let input: Vec<_> = (0..width)
+                .map(|index| ((index * 31 + 3) % 17) as f32 - 8.0)
+                .collect();
+            let expected = scalar_reference(&filter, &input, -0.5, delay);
+            let mut actual = input.clone();
+            filter.filter_signal_in_place(
+                Level::new(),
+                &mut [actual.as_mut_slice()],
+                [-0.5],
+                delay,
+            );
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 1e-3,
+                    "width={width} delay={delay} index={index}: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+}

@@ -1,83 +1,127 @@
-use rand::distr::Distribution;
-use siphasher::sip::SipHasher;
-use std::hash::{Hash, Hasher};
+use core::ops::{Add, Mul, Range, Sub};
 
-pub struct Geometric {
-    lambda: f64,
-}
-
-impl Geometric {
-    pub fn new(p: f64) -> Self {
-        if p <= 0.0 || p > 1.0 {
-            panic!("Invalid probability: {p}");
-        }
-
-        Geometric {
-            lambda: (1.0 - p).ln(),
-        }
+/// Lambda parameter for generating a geometric distribution where each trial has probability `p`.
+pub fn geometric_lambda(p: f64) -> f64 {
+    if p <= 0.0 || p > 1.0 {
+        panic!("Invalid probability: {p}");
     }
+    (1.0 - p).ln()
 }
 
-impl Distribution<usize> for Geometric {
-    // We can simulate a geometric distribution by taking the floor of an exponential distribution
-    // https://en.wikipedia.org/wiki/Geometric_distribution#Related_distributions
-    fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> usize {
-        (rng.random::<f64>().ln() / self.lambda) as usize
-    }
-}
-
-pub trait FromSeeder {
-    fn from_seeder(input: u64) -> Self;
-}
-
-impl FromSeeder for u64 {
-    #[inline(always)]
-    fn from_seeder(input: u64) -> Self {
-        input
-    }
-}
-
-impl FromSeeder for i32 {
-    #[inline(always)]
-    fn from_seeder(input: u64) -> Self {
-        (input & (u32::MAX as u64)) as i32
-    }
-}
-
-impl FromSeeder for f64 {
-    #[inline(always)]
-    fn from_seeder(input: u64) -> Self {
-        f64::from_bits((input | 0x3FF0000000000000) & 0x3FFFFFFFFFFFFFFF) - 1.0
-    }
-}
-
-impl FromSeeder for f32 {
-    #[inline(always)]
-    fn from_seeder(input: u64) -> Self {
-        f32::from_bits(((input & 0xFFFFFFFF) as u32 >> 9) | 0x3F800000) - 1.0
-    }
-}
-
-/// RNG seed generator which allows you to mix in as much of your own entropy as you want before generating the final
-/// seed.
+/// Deterministic RNG used by current upstream ntsc-rs. It advances by the
+/// SplitMix64 Weyl increment and applies upstream's selected finalizer for the
+/// requested output type.
 #[derive(Clone)]
-pub struct Seeder {
-    state: SipHasher,
+pub struct SplitMix64 {
+    state: u64,
 }
 
-impl Seeder {
-    pub fn new<T: Hash>(seed: T) -> Self {
-        let mut hasher = SipHasher::new_with_keys(0, 0);
-        seed.hash(&mut hasher);
-        Seeder { state: hasher }
+const PHI: u64 = 0x9e3779b97f4a7c15;
+
+impl SplitMix64 {
+    pub fn random<T: FromState>(&mut self) -> T {
+        self.state = self.state.wrapping_add(PHI);
+        T::finalize(self.state)
     }
 
-    pub fn mix<T: Hash>(mut self, input: T) -> Self {
-        input.hash(&mut self.state);
-        self
+    /// Uniform float in `[low, high)`.
+    #[inline]
+    pub fn random_range<T: Rangeable>(&mut self, range: Range<T>) -> T {
+        range.start + self.random::<T>() * (range.end - range.start)
     }
 
-    pub fn finalize<T: FromSeeder>(self) -> T {
-        T::from_seeder(self.state.finish())
+    pub fn random_geometric(&mut self, lambda: f64) -> usize {
+        (self.random::<f64>().ln() / lambda) as usize
+    }
+}
+
+pub trait Rangeable:
+    Add<Output = Self> + Sub<Output = Self> + Mul<Output = Self> + Copy + FromState
+{
+}
+impl Rangeable for f32 {}
+impl Rangeable for f64 {}
+
+/// Convert one SplitMix64 state using the finalizer selected by upstream.
+pub trait FromState {
+    fn finalize(state: u64) -> Self;
+}
+
+impl FromState for u32 {
+    fn finalize(mut state: u64) -> Self {
+        // David Stafford's Mix4 variant of the MurmurHash3 64-bit finalizer.
+        state = (state ^ (state >> 33)).wrapping_mul(0x62A9D9ED799705F5);
+        state = (state ^ (state >> 28)).wrapping_mul(0xCB24D0A5C88C35B3);
+        (state >> 32) as u32
+    }
+}
+
+impl FromState for i32 {
+    fn finalize(state: u64) -> Self {
+        u32::finalize(state) as i32
+    }
+}
+
+impl FromState for u64 {
+    fn finalize(mut state: u64) -> Self {
+        state = (state ^ (state >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        state = (state ^ (state >> 27)).wrapping_mul(0x94d049bb133111eb);
+        state ^ (state >> 31)
+    }
+}
+
+impl FromState for i64 {
+    fn finalize(state: u64) -> Self {
+        u64::finalize(state) as i64
+    }
+}
+
+impl FromState for f32 {
+    fn finalize(state: u64) -> Self {
+        (u32::finalize(state) >> 8) as f32 * (1.0 / (1u32 << 24) as f32)
+    }
+}
+
+impl FromState for f64 {
+    fn finalize(state: u64) -> Self {
+        (u64::finalize(state) >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+}
+
+impl SplitMix64 {
+    pub fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    /// Mix an independent seed into the RNG and finalize it once.
+    pub fn mix(mut self, input: u64) -> Self {
+        self.state = self.state.wrapping_add(input);
+        Self {
+            state: self.random(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_seed_sequence_matches_upstream() {
+        let mut rng = SplitMix64::new(0x0123_4567_89ab_cdef);
+        assert_eq!(rng.random::<u64>(), 0x157a_3807_a48f_aa9d);
+        assert_eq!(rng.random::<u64>(), 0xd573_529b_34a1_d093);
+        assert_eq!(rng.random::<u64>(), 0x2f90_b72e_996d_ccbe);
+    }
+
+    #[test]
+    fn mix4_and_float_sequences_are_fixed() {
+        let mut ints = SplitMix64::new(47).mix(6).mix(13);
+        assert_eq!(ints.random::<u32>(), 0x7241_ffb0);
+        assert_eq!(ints.random::<u32>(), 0x7c04_a0eb);
+
+        let mut floats = SplitMix64::new(47).mix(6).mix(13);
+        assert_eq!(floats.random::<f32>().to_bits(), 0x3ee4_83fe);
+        assert_eq!(floats.random::<f32>().to_bits(), 0x3ef8_0940);
     }
 }

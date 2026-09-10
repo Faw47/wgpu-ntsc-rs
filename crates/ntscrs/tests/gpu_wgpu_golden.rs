@@ -38,6 +38,7 @@ fn compare(
     scale: [f32; 2],
     label: &str,
 ) {
+    let submissions_before = backend.submitted_effects();
     let mut input = vec![0.0; YiqView::buf_length_for((width, height), YiqField::Both)];
     {
         let view = YiqView::from_parts(&mut input, (width, height), YiqField::Both);
@@ -53,6 +54,11 @@ fn compare(
     let mut gpu_view = YiqView::from_parts(&mut input, (width, height), YiqField::Both);
     let mut frame = backend.upload_frame(&gpu_view);
     backend.apply_effect(effect, &mut frame, frame_num, scale);
+    assert_eq!(
+        backend.submitted_effects(),
+        submissions_before + 1,
+        "{label}: WGPU effect command buffer was not submitted"
+    );
     frame.download(&mut gpu_view);
     for (plane, expected, actual) in [
         ("Y", cpu_view.y, gpu_view.y),
@@ -158,6 +164,83 @@ fn deterministic_effect_matrix_matches_cpu() {
 
 #[test]
 #[ignore = "requires a compute adapter"]
+fn disabled_scale_settings_preserve_non_unit_proxy_scale() {
+    let mut gpu = WgpuBackend::new().expect("a compute adapter is required");
+    let mut effect = clean_effect();
+    effect.scale = None;
+    effect.luma_smear = 0.75;
+
+    let dimensions = (65, 33);
+    let mut unit = vec![0.25; YiqView::buf_length_for(dimensions, YiqField::Both)];
+    let mut proxy = unit.clone();
+    effect.apply_effect_to_yiq(
+        &mut YiqView::from_parts(&mut unit, dimensions, YiqField::Both),
+        3,
+        [1.0, 1.0],
+    );
+    effect.apply_effect_to_yiq(
+        &mut YiqView::from_parts(&mut proxy, dimensions, YiqField::Both),
+        3,
+        [1.75, 0.5],
+    );
+    assert_ne!(unit, proxy, "caller scale must affect the CPU reference");
+
+    compare(
+        &mut gpu,
+        &effect,
+        dimensions.0,
+        dimensions.1,
+        3,
+        [1.75, 0.5],
+        "scale-disabled-proxy",
+    );
+}
+
+#[test]
+#[ignore = "requires a compute adapter"]
+fn alternating_field_selection_matches_cpu_for_both_parities() {
+    use ntsc_rs::gpu::{BackendType, runner::NtscEffectRunner};
+
+    let mut runner = NtscEffectRunner::new(BackendType::Wgpu);
+    assert_eq!(runner.requested_backend(), BackendType::Wgpu);
+    assert_eq!(runner.active_backend(), BackendType::Wgpu);
+    let mut effect = NtscEffect::default();
+    effect.use_field = UseField::Alternating;
+
+    for frame_num in [0, 1, 8, 9] {
+        let field = effect.use_field.to_yiq_field(frame_num);
+        assert_eq!(
+            field,
+            if frame_num % 2 == 0 {
+                YiqField::Upper
+            } else {
+                YiqField::Lower
+            }
+        );
+        let dimensions = (65, 33);
+        let mut input = vec![0.0; YiqView::buf_length_for(dimensions, field)];
+        for (index, sample) in input.iter_mut().enumerate() {
+            *sample = ((index * 17 + frame_num * 13) % 97) as f32 / 150.0;
+        }
+        let mut expected = input.clone();
+        let mut cpu = YiqView::from_parts(&mut expected, dimensions, field);
+        effect.apply_effect_to_yiq(&mut cpu, frame_num, [1.0, 1.0]);
+        let mut actual = YiqView::from_parts(&mut input, dimensions, field);
+        let submissions_before = runner.wgpu_submitted_effects();
+        runner.apply_effect(&mut actual, &effect, frame_num, [1.0, 1.0]);
+        assert_eq!(runner.last_backend(), BackendType::Wgpu);
+        assert!(runner.fallback_reason().is_none());
+        assert!(runner.wgpu_submitted_effects() > submissions_before);
+        for (reference, gpu) in [(cpu.y, actual.y), (cpu.i, actual.i), (cpu.q, actual.q)] {
+            for (&a, &b) in reference.iter().zip(gpu.iter()) {
+                assert!(a.is_finite() && b.is_finite() && (a - b).abs() <= 2e-3);
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a compute adapter"]
 fn stochastic_effects_and_complete_presets_match_cpu() {
     let mut gpu = WgpuBackend::new().expect("a compute adapter is required");
     let mut cases = vec![("complete-default", NtscEffect::default())];
@@ -210,7 +293,13 @@ fn stochastic_effects_and_complete_presets_match_cpu() {
 fn field_modes_and_reused_buffers_match_cpu() {
     use ntsc_rs::gpu::{BackendType, runner::NtscEffectRunner};
     let mut runner = NtscEffectRunner::new(BackendType::Wgpu);
+    assert_eq!(runner.requested_backend(), BackendType::Wgpu);
     assert_eq!(runner.active_backend(), BackendType::Wgpu);
+    assert!(runner.fallback_reason().is_none());
+    let adapter = runner
+        .wgpu_adapter_info()
+        .expect("active WGPU backend must expose its adapter");
+    assert!(!adapter.name.is_empty());
     let mut effect = NtscEffect::default();
     effect.scale.as_mut().unwrap().scale_with_video_size = true;
     for field in [
@@ -230,8 +319,11 @@ fn field_modes_and_reused_buffers_match_cpu() {
                 let mut cpu_view = YiqView::from_parts(&mut expected, (width, height), field);
                 effect.apply_effect_to_yiq(&mut cpu_view, frame, [1.25, 0.75]);
                 let mut gpu_view = YiqView::from_parts(&mut input, (width, height), field);
+                let submissions_before = runner.wgpu_submitted_effects();
                 runner.apply_effect(&mut gpu_view, &effect, frame, [1.25, 0.75]);
                 assert_eq!(runner.last_backend(), BackendType::Wgpu);
+                assert!(runner.fallback_reason().is_none());
+                assert!(runner.wgpu_submitted_effects() > submissions_before);
                 for (cpu, gpu) in [
                     (cpu_view.y, gpu_view.y),
                     (cpu_view.i, gpu_view.i),

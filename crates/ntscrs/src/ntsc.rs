@@ -1,15 +1,13 @@
-use std::{f32::consts::FRAC_1_SQRT_2, ops::RangeInclusive};
+use std::{f32::consts::FRAC_1_SQRT_2, ops::Range};
 
 use core::f32::consts::PI;
 use fearless_simd::{Level, dispatch, prelude::*};
-use rand::{Rng, RngCore, SeedableRng};
-use rand_xoshiro::Xoshiro256PlusPlus;
 
 use crate::{
     backend::{BackendManager, BackendPreference, FrameDescriptor, RuntimeBackend},
     filter::TransferFunction,
     noise::{Fbm, Simplex, Simplex1d, Simplex2d, add_noise_1d, sample_noise_1d, sample_noise_2d},
-    random::{Geometric, Seeder},
+    random::{SplitMix64, geometric_lambda},
     settings::standard::*,
     shift::{BoundaryHandling, shift_row, shift_row_to},
     thread_pool::{self, ZipChunks, with_thread_pool},
@@ -182,6 +180,35 @@ struct CommonInfo {
     horizontal_scale: f32,
     /// The "vertical scale" setting.
     vertical_scale: f32,
+}
+
+/// Resolve caller/proxy scaling and optional user scaling exactly once so the
+/// CPU and WGPU paths cannot drift. Current upstream always preserves the
+/// caller-provided scale, even when the optional ScaleSettings block is off.
+pub(crate) fn effective_scale_factors(
+    settings: &NtscEffect,
+    height: usize,
+    scale_factor: [f32; 2],
+) -> [f32; 2] {
+    let video_size_scale = if settings
+        .scale
+        .as_ref()
+        .is_some_and(|scale| scale.scale_with_video_size)
+    {
+        height as f32 / 480.0
+    } else {
+        1.0
+    };
+    let setting_scale = settings
+        .scale
+        .as_ref()
+        .map(|scale| [scale.horizontal_scale, scale.vertical_scale])
+        .unwrap_or([1.0, 1.0]);
+
+    [
+        scale_factor[0] * video_size_scale * setting_scale[0],
+        scale_factor[1] * video_size_scale * setting_scale[1],
+    ]
 }
 
 struct FixedQueue<T, const N: usize> {
@@ -611,7 +638,7 @@ pub(crate) mod noise_seeds {
 /// Helper function to apply gradient noise to a single row of a single plane.
 fn video_noise_line(
     row: &mut [f32],
-    seeder: &Seeder,
+    rng: &SplitMix64,
     level: Level,
     index: usize,
     frequency: f32,
@@ -619,12 +646,12 @@ fn video_noise_line(
     detail: u32,
 ) {
     let width = row.len();
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seeder.clone().mix(index as u64).finalize());
-    let noise_seed = rng.next_u32();
+    let mut rng = rng.clone().mix(index as u64);
+    let noise_seed = rng.random::<i32>();
     let offset = rng.random::<f32>() * width as f32;
 
     let noise = Fbm {
-        seed: noise_seed as i32,
+        seed: noise_seed,
         octaves: detail.clamp(1, 5) as usize,
         gain: 1.0,
         lacunarity: 2.0,
@@ -637,14 +664,14 @@ fn video_noise_line(
 /// Add gradient noise to an NTSC-encoded (composite) signal.
 fn composite_noise(yiq: &mut YiqView, info: &CommonInfo, noise_settings: &FbmNoiseSettings) {
     let width = yiq.dimensions.0;
-    let seeder = Seeder::new(info.seed)
+    let rng = SplitMix64::new(info.seed)
         .mix(noise_seeds::VIDEO_COMPOSITE)
-        .mix(info.frame_num);
+        .mix(info.frame_num as u64);
 
     ZipChunks::new([yiq.y], width).par_for_each(|index, [row]| {
         video_noise_line(
             row,
-            &seeder,
+            &rng,
             info.level,
             index,
             noise_settings.frequency / info.horizontal_scale,
@@ -662,12 +689,14 @@ fn plane_noise(
     settings: &FbmNoiseSettings,
     noise_seed: u64,
 ) {
-    let seeder = Seeder::new(info.seed).mix(noise_seed).mix(info.frame_num);
+    let rng = SplitMix64::new(info.seed)
+        .mix(noise_seed)
+        .mix(info.frame_num as u64);
 
     ZipChunks::new([plane], width).par_for_each(|index, [row]| {
         video_noise_line(
             row,
-            &seeder,
+            &rng,
             info.level,
             index,
             settings.frequency / info.horizontal_scale,
@@ -706,27 +735,14 @@ fn chroma_phase_error(yiq: &mut YiqView, intensity: f32) {
 /// Add per-scanline chroma phase error.
 fn chroma_phase_noise(yiq: &mut YiqView, info: &CommonInfo, intensity: f32) {
     let width = yiq.dimensions.0;
-    let seed = Seeder::new(info.seed)
+    let rng = SplitMix64::new(info.seed)
         .mix(noise_seeds::VIDEO_CHROMA_PHASE)
-        .mix(info.frame_num)
-        .finalize::<u64>();
+        .mix(info.frame_num as u64);
 
     ZipChunks::new([yiq.i, yiq.q], width).par_for_each(|index, [i, q]| {
-        // Simple hash to generate a per-line random value from the base seed and line index.
-        // This is much faster than cloning and finalizing a SipHasher or re-seeding Xoshiro for every line.
-        let mut h = seed.wrapping_add(index as u64);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51afd7ed558ccd);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
-        h ^= h >> 33;
-
-        // Map the u64 to a f32 in the range [0.0, 1.0)
-        let val = (h as f32) / (u64::MAX as f32 + 1.0);
-
         // Phase shift angle in radians. Mapped so that an intensity of 1.0 is a phase shift ranging from a full
         // rotation to the left, to a full rotation to the right.
-        let phase_shift = (val - 0.5) * 2.0 * intensity;
+        let phase_shift = (rng.clone().mix(index as u64).random::<f32>() - 0.5) * 2.0 * intensity;
 
         chroma_phase_offset_line(i, q, phase_shift);
     });
@@ -756,14 +772,14 @@ fn head_switching(
     let scratch = &mut yiq.scratch[start_row * width..];
     let cut_off_rows = num_affected_rows.saturating_sub(height);
 
-    let seeder = Seeder::new(info.seed)
+    let rng = SplitMix64::new(info.seed)
         .mix(noise_seeds::HEAD_SWITCHING)
-        .mix(info.frame_num);
+        .mix(info.frame_num as u64);
 
     ZipChunks::new([affected_rows, scratch], width).par_for_each(|index, [row, scratch]| {
         let index = num_affected_rows - (index + cut_off_rows);
         let row_shift = shift * ((index + offset) as f32 / num_rows as f32).powf(1.5);
-        let noisy_shift = (row_shift + (seeder.clone().mix(index).finalize::<f32>() - 0.5))
+        let noisy_shift = (row_shift + (rng.clone().mix(index as u64).random::<f32>() - 0.5))
             * info.horizontal_scale;
 
         if index == num_affected_rows
@@ -778,14 +794,12 @@ fn head_switching(
                 info.level,
             );
 
-            let seeder = Seeder::new(info.seed)
+            let mut rng = SplitMix64::new(info.seed)
                 .mix(noise_seeds::HEAD_SWITCHING_MID_LINE_JITTER)
-                .mix(info.frame_num);
+                .mix(info.frame_num as u64);
 
             // Average two random numbers to bias the result towards the middle
-            let jitter_rand = (seeder.clone().mix(0).finalize::<f32>()
-                + seeder.clone().mix(1).finalize::<f32>())
-                * 0.5;
+            let jitter_rand = (rng.random::<f32>() + rng.random::<f32>()) * 0.5;
             let jitter = (jitter_rand - 0.5) * mid_line.jitter;
 
             let copy_start = (width as f32 * (mid_line.position + jitter)) as usize;
@@ -795,7 +809,7 @@ fn head_switching(
             row[copy_start..].copy_from_slice(&scratch[copy_start..]);
 
             // Add a transient where the head switch is supposed to start
-            let transient_intensity = (seeder.clone().mix(0).finalize::<f32>() + 0.5) * 0.5;
+            let transient_intensity = (rng.random::<f32>() + 0.5) * 0.5;
             let transient_len = 16.0 * info.horizontal_scale;
 
             for i in copy_start..(copy_start + transient_len.ceil() as usize).min(width) {
@@ -816,14 +830,14 @@ fn head_switching(
 /// Helper function for generating "snow"/transient speckles.
 fn row_speckles(
     row: &mut [f32],
-    rng: &mut Xoshiro256PlusPlus,
+    rng: &mut SplitMix64,
     intensity: f32,
     anisotropy: f32,
     horizontal_scale: f32,
 ) {
     let intensity = intensity as f64;
     let anisotropy = anisotropy as f64;
-    const TRANSIENT_LEN_RANGE: RangeInclusive<f32> = 8.0..=64.0;
+    const TRANSIENT_LEN_RANGE: Range<f32> = 8.0..64.0;
 
     // Anisotropy controls how much the snow appears "clumped" within given lines vs. appearing independently across
     // lines.
@@ -851,25 +865,24 @@ fn row_speckles(
     // We can simulate the distance between each "snow" pixel with a geometric distribution which avoids having to
     // loop over every pixel:
     // https://en.wikipedia.org/wiki/Geometric_distribution
-    let dist = Geometric::new(line_snow_intensity);
+    let dist = geometric_lambda(line_snow_intensity);
     // Start leftwards of the visible region to simulate transients that may have started before it. This avoids
     // transients being sparser towards the leftmost edge.
-    let mut pixel_idx = (-TRANSIENT_LEN_RANGE.end()).floor() as isize;
+    let mut pixel_idx = (-TRANSIENT_LEN_RANGE.end).floor() as isize;
     loop {
-        pixel_idx += rng.sample(&dist).min(isize::MAX as usize) as isize;
+        pixel_idx += rng.random_geometric(dist).min(isize::MAX as usize) as isize;
         if pixel_idx >= row.len() as isize {
             break;
         }
 
         let transient_len: f32 = rng.random_range(TRANSIENT_LEN_RANGE) * horizontal_scale;
-        let transient_freq = rng.random_range(transient_len * 3.0..=transient_len * 5.0);
+        let transient_freq = rng.random_range(transient_len * 3.0..transient_len * 5.0);
         let pixel_idx_end = pixel_idx + transient_len.ceil() as isize;
 
         // Each transient gets its own RNG to determine the intensity of each pixel within it.
         // This is to prevent the length of each transient from affecting the random state of the subsequent
         // transient, which can cause the snow to "jitter" when changing the "bandwidth scale" setting.
-        rng.jump();
-        let mut transient_rng = rng.clone();
+        let mut transient_rng = SplitMix64::new(rng.random());
 
         for i in pixel_idx.clamp(0, row.len() as isize)..pixel_idx_end.clamp(0, row.len() as isize)
         {
@@ -902,12 +915,11 @@ fn tracking_noise(
     let width = yiq.dimensions.0;
     let height = yiq.num_rows();
 
-    let mut seeder = Seeder::new(info.seed)
+    let mut rng = SplitMix64::new(info.seed)
         .mix(noise_seeds::TRACKING_NOISE)
-        .mix(info.frame_num);
-    let noise_seed = seeder.clone().mix(0).finalize::<i32>();
-    let offset = seeder.clone().mix(1).finalize::<f32>() * yiq.num_rows() as f32;
-    seeder = seeder.mix(2);
+        .mix(info.frame_num as u64);
+    let noise_seed = rng.random::<i32>();
+    let offset = rng.random::<f32>() * yiq.num_rows() as f32;
 
     // Handle cases where the number of affected rows exceeds the number of actual rows in the image
     let start_row = height.max(num_rows) - num_rows;
@@ -927,8 +939,6 @@ fn tracking_noise(
         shift_noise,
     );
 
-    let base_seed = seeder.clone().finalize::<u64>();
-
     ZipChunks::new([affected_rows], width).par_for_each(|index, [row]| {
         let index = index + cut_off_rows;
         // This iterates from the top down. Increase the intensity as we approach the bottom of the picture.
@@ -946,7 +956,7 @@ fn tracking_noise(
 
         video_noise_line(
             row,
-            &seeder,
+            &rng,
             info.level,
             index,
             0.25 / info.horizontal_scale,
@@ -954,15 +964,9 @@ fn tracking_noise(
             1,
         );
 
-        let mut h = base_seed.wrapping_add(index as u64);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51afd7ed558ccd);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
-        h ^= h >> 33;
         row_speckles(
             row,
-            &mut Xoshiro256PlusPlus::seed_from_u64(h),
+            &mut rng.clone().mix(index as u64),
             snow_intensity * intensity_scale.powi(2),
             snow_anisotropy,
             info.horizontal_scale,
@@ -972,22 +976,14 @@ fn tracking_noise(
 
 /// Add random bits of "snow" to an NTSC-encoded signal.
 fn snow(yiq: &mut YiqView, info: &CommonInfo, intensity: f32, anisotropy: f32) {
-    let seed = Seeder::new(info.seed)
+    let rng = SplitMix64::new(info.seed)
         .mix(noise_seeds::SNOW)
-        .mix(info.frame_num)
-        .finalize::<u64>();
+        .mix(info.frame_num as u64);
 
     ZipChunks::new([yiq.y], yiq.dimensions.0).par_for_each(|index, [row]| {
-        let mut h = seed.wrapping_add(index as u64);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xff51afd7ed558ccd);
-        h ^= h >> 33;
-        h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
-        h ^= h >> 33;
-
         row_speckles(
             row,
-            &mut Xoshiro256PlusPlus::seed_from_u64(h),
+            &mut rng.clone().mix(index as u64),
             intensity,
             anisotropy,
             info.horizontal_scale,
@@ -1087,9 +1083,9 @@ fn vhs_edge_wave(yiq: &mut YiqView, info: &CommonInfo, settings: &VHSEdgeWaveSet
     let width = yiq.dimensions.0;
     let height = yiq.num_rows();
 
-    let seeder = Seeder::new(info.seed).mix(noise_seeds::EDGE_WAVE);
-    let noise_seed: i32 = seeder.clone().mix(0).finalize();
-    let offset = seeder.mix(1).finalize::<f32>() * yiq.num_rows() as f32;
+    let mut rng = SplitMix64::new(info.seed).mix(noise_seeds::EDGE_WAVE);
+    let noise_seed = rng.random::<i32>();
+    let offset = rng.random::<f32>() * yiq.num_rows() as f32;
     let noise_dest = &mut yiq.scratch[..height];
 
     let noise = Fbm {
@@ -1121,20 +1117,17 @@ fn chroma_loss(yiq: &mut YiqView, info: &CommonInfo, intensity: f32) {
     let width = yiq.dimensions.0;
     let height = yiq.num_rows();
 
-    let seed = Seeder::new(info.seed)
+    let mut rng = SplitMix64::new(info.seed)
         .mix(noise_seeds::CHROMA_LOSS)
-        .mix(info.frame_num)
-        .finalize();
-
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+        .mix(info.frame_num as u64);
     // We blank out each row with a probability of `intensity` (0 to 1). Instead of going over each row and checking
     // whether to blank out the chroma, use a geometric distribution to simulate that process and tell us which rows
     // to blank.
-    let dist = Geometric::new(intensity as f64);
+    let dist = geometric_lambda(intensity as f64);
 
     let mut row_idx = 0usize;
     loop {
-        row_idx += rng.sample(&dist);
+        row_idx += rng.random_geometric(dist);
         if row_idx >= height {
             break;
         }
@@ -1189,32 +1182,13 @@ impl NtscEffect {
 
         let seed = self.random_seed as u32 as u64;
 
-        let scale_factor = scale_factor.map(|scale_factor| {
-            scale_factor
-                * if self
-                    .scale
-                    .as_ref()
-                    .is_some_and(|scale| scale.scale_with_video_size)
-                {
-                    yiq.dimensions.1 as f32 / 480.0
-                } else {
-                    1.0
-                }
-        });
+        let scale_factor = effective_scale_factors(self, yiq.dimensions.1, scale_factor);
         let info = CommonInfo {
             level: Level::new(),
             seed,
             frame_num,
-            horizontal_scale: self
-                .scale
-                .as_ref()
-                .map(|scale| scale.horizontal_scale * scale_factor[0])
-                .unwrap_or(1.0),
-            vertical_scale: self
-                .scale
-                .as_ref()
-                .map(|scale| scale.vertical_scale * scale_factor[1])
-                .unwrap_or(1.0),
+            horizontal_scale: scale_factor[0],
+            vertical_scale: scale_factor[1],
         };
 
         luma_filter(yiq, &info, self.input_luma_filter);
@@ -1657,11 +1631,13 @@ mod tests {
         settings: &FbmNoiseSettings,
         noise_seed: u64,
     ) {
-        let seeder = Seeder::new(info.seed).mix(noise_seed).mix(info.frame_num);
+        let rng = SplitMix64::new(info.seed)
+            .mix(noise_seed)
+            .mix(info.frame_num as u64);
         for (index, row) in plane.chunks_exact_mut(width).enumerate() {
             video_noise_line(
                 row,
-                &seeder,
+                &rng,
                 info.level,
                 index,
                 settings.frequency / info.horizontal_scale,
@@ -1737,6 +1713,53 @@ mod tests {
         plane_noise_reference(&mut reference, width, &info, &settings, noise_seed);
 
         assert_almost_eq(&plane, &reference, 1e-6);
+    }
+
+    #[test]
+    fn disabled_scale_settings_preserve_proxy_scale() {
+        let mut effect = NtscEffect::default();
+        effect.scale = None;
+        assert_eq!(
+            effective_scale_factors(&effect, 720, [0.5, 0.75]),
+            [0.5, 0.75]
+        );
+
+        effect.scale = Some(ScaleSettings {
+            horizontal_scale: 1.5,
+            vertical_scale: 2.0,
+            scale_with_video_size: true,
+        });
+        assert_eq!(
+            effective_scale_factors(&effect, 720, [0.5, 0.75]),
+            [1.125, 2.25]
+        );
+    }
+
+    #[test]
+    fn pinned_upstream_default_fixed_seed_fingerprint() {
+        let dimensions = (65, 33);
+        let mut buffer = vec![0.0; YiqView::buf_length_for(dimensions, YiqField::Both)];
+        {
+            let yiq = YiqView::from_parts(&mut buffer, dimensions, YiqField::Both);
+            for index in 0..dimensions.0 * dimensions.1 {
+                yiq.y[index] = ((index * 13 + index / dimensions.0 * 7) % 256) as f32 / 255.0;
+                yiq.i[index] = ((index * 5 + 11) % 97) as f32 / 200.0 - 0.24;
+                yiq.q[index] = ((index * 3 + 17) % 89) as f32 / 200.0 - 0.22;
+            }
+        }
+
+        let mut effect = NtscEffect::default();
+        effect.random_seed = -47;
+        effect.apply_effect_to_yiq(
+            &mut YiqView::from_parts(&mut buffer, dimensions, YiqField::Both),
+            13,
+            [1.25, 0.75],
+        );
+
+        let fingerprint = buffer.iter().fold(0xcbf2_9ce4_8422_2325, |hash, value| {
+            (hash ^ u64::from(value.to_bits())).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+        assert_eq!(fingerprint, 0xb95f_09d0_ce6a_f57a);
     }
 
     #[test]

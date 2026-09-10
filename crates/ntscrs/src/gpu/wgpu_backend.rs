@@ -157,6 +157,7 @@ pub struct WgpuBackend {
     data_index: std::cell::Cell<usize>,
     filter_cache: std::cell::RefCell<std::collections::HashMap<[u32; 16], wgpu::BindGroup>>,
     pub adapter_info: wgpu::AdapterInfo,
+    submitted_effects: u64,
 }
 
 impl WgpuBackend {
@@ -225,7 +226,6 @@ impl WgpuBackend {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/filter_plane.wgsl").into()),
         });
 
-        let xoshiro_src = include_str!("shaders/xoshiro.wgsl");
         let simplex_src = include_str!("shaders/simplex.wgsl");
 
         let chroma_loss_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -425,14 +425,7 @@ impl WgpuBackend {
         });
         let phase_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chroma phase"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!(
-                    "{}\n{}",
-                    xoshiro_src,
-                    include_str!("shaders/chroma_phase.wgsl")
-                )
-                .into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/chroma_phase.wgsl").into()),
         });
         let chroma_phase_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -540,7 +533,14 @@ impl WgpuBackend {
             data_index: Default::default(),
             filter_cache: Default::default(),
             adapter_info: adapter.get_info(),
+            submitted_effects: 0,
         })
+    }
+
+    /// Number of effect command buffers submitted by this backend instance.
+    /// Readback-only submissions are deliberately excluded.
+    pub fn submitted_effects(&self) -> u64 {
+        self.submitted_effects
     }
 
     fn dispatch_filter_plane<'a>(
@@ -869,15 +869,8 @@ impl GpuBackend for WgpuBackend {
         use super::prepare;
         let size = (frame.width * frame.height * std::mem::size_of::<f32>()) as u64;
         let mut ring_idx = 0;
-        let video_scale = if effect
-            .scale
-            .as_ref()
-            .is_some_and(|s| s.scale_with_video_size)
-        {
-            frame.full_height as f32 / 480.0
-        } else {
-            1.0
-        };
+        let [horizontal_scale, vertical_scale] =
+            crate::ntsc::effective_scale_factors(effect, frame.full_height, scale_factor);
         let mut params = ShaderParams {
             width: frame.width as u32,
             frame_num: frame_num as u32,
@@ -895,16 +888,8 @@ impl GpuBackend for WgpuBackend {
             chroma_delay_horizontal: effect.chroma_delay_horizontal,
 
             chroma_delay_vertical: effect.chroma_delay_vertical,
-            horizontal_scale: effect
-                .scale
-                .as_ref()
-                .map(|s| s.horizontal_scale * scale_factor[0] * video_scale)
-                .unwrap_or(1.0),
-            vertical_scale: effect
-                .scale
-                .as_ref()
-                .map(|s| s.vertical_scale * scale_factor[1] * video_scale)
-                .unwrap_or(1.0),
+            horizontal_scale,
+            vertical_scale,
             _pad1: 0,
             _pad2: 0,
             _pad3: 0,
@@ -1333,5 +1318,6 @@ impl GpuBackend for WgpuBackend {
         );
 
         self.queue.submit(Some(encoder.finish()));
+        self.submitted_effects += 1;
     }
 }

@@ -43,6 +43,7 @@ impl GpuBackend for CpuBackend {
 }
 
 pub struct NtscEffectRunner {
+    requested_backend: BackendType,
     backend_type: BackendType,
     last_backend: BackendType,
     fallback_reason: Option<&'static str>,
@@ -56,6 +57,8 @@ impl NtscEffectRunner {
     pub fn new(requested_backend: BackendType) -> Self {
         #[allow(unused_mut)]
         let mut actual_backend = BackendType::Cpu;
+        #[allow(unused_mut)]
+        let mut fallback_reason = None;
 
         #[cfg(feature = "gpu-wgpu")]
         let mut wgpu_backend = None;
@@ -77,9 +80,12 @@ impl NtscEffectRunner {
                         );
                         wgpu_backend = Some(backend);
                         actual_backend = BackendType::Wgpu;
+                    } else {
+                        fallback_reason = Some("automatic selection rejected a CPU WGPU adapter");
                     }
                 } else {
                     println!("ntsc-rs: Failed to initialize WGPU backend, falling back to CPU.");
+                    fallback_reason = Some("WGPU initialization failed");
                 }
             }
             #[cfg(not(feature = "gpu-wgpu"))]
@@ -87,9 +93,10 @@ impl NtscEffectRunner {
         }
 
         Self {
+            requested_backend,
             backend_type: actual_backend,
             last_backend: BackendType::Cpu,
-            fallback_reason: None,
+            fallback_reason,
             #[cfg(feature = "gpu-wgpu")]
             frames: [None, None],
             #[cfg(feature = "gpu-wgpu")]
@@ -101,6 +108,10 @@ impl NtscEffectRunner {
         self.backend_type
     }
 
+    pub fn requested_backend(&self) -> BackendType {
+        self.requested_backend
+    }
+
     /// Backend that actually rendered the most recent frame, including per-effect fallbacks.
     pub fn last_backend(&self) -> BackendType {
         self.last_backend
@@ -108,6 +119,20 @@ impl NtscEffectRunner {
 
     pub fn fallback_reason(&self) -> Option<&'static str> {
         self.fallback_reason
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    pub fn wgpu_adapter_info(&self) -> Option<&wgpu::AdapterInfo> {
+        self.wgpu_backend
+            .as_ref()
+            .map(|backend| &backend.adapter_info)
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    pub fn wgpu_submitted_effects(&self) -> u64 {
+        self.wgpu_backend
+            .as_ref()
+            .map_or(0, |backend| backend.submitted_effects())
     }
 
     pub fn apply_effect(
@@ -118,13 +143,13 @@ impl NtscEffectRunner {
         scale_factor: [f32; 2],
     ) {
         self.last_backend = BackendType::Cpu;
-        self.fallback_reason = None;
         match self.backend_type {
             BackendType::Cpu => {
                 effect.apply_effect_to_yiq(src, frame_num, scale_factor);
             }
             #[cfg(feature = "gpu-wgpu")]
             BackendType::Wgpu => {
+                self.fallback_reason = None;
                 let backend = self.wgpu_backend.as_mut().unwrap();
                 let dimensions = src.dimensions;
                 if src.y.is_empty() {
