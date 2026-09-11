@@ -353,22 +353,19 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         else { sample_val = scratch_plane[read_idx]; }
 
         let fused = (filter_coeffs.initial_condition_mode & 2u) != 0u;
-        let filtered = vec4<f32>(
-            upstream_mul_add(num.x, sample_val, z.x, fused),
-            upstream_mul_add(num.y, sample_val, z.y, fused),
-            upstream_mul_add(num.z, sample_val, z.z, fused),
-            upstream_mul_add(num.w, sample_val, z.w, fused),
-        );
-        let filt_sample = filtered.x;
+        let filt_sample = upstream_mul_add(num.x, sample_val, z.x, fused);
 
         if (filter_len > 1u) {
-            z.x = upstream_mul_add(-den.x, filt_sample, filtered.y, fused);
+            let filtered_y = upstream_mul_add(num.y, sample_val, z.y, fused);
+            z.x = upstream_mul_add(-den.x, filt_sample, filtered_y, fused);
         }
         if (filter_len > 2u) {
-            z.y = upstream_mul_add(-den.y, filt_sample, filtered.z, fused);
+            let filtered_z = upstream_mul_add(num.z, sample_val, z.z, fused);
+            z.y = upstream_mul_add(-den.y, filt_sample, filtered_z, fused);
         }
         if (filter_len > 3u) {
-            z.z = upstream_mul_add(-den.z, filt_sample, filtered.w, fused);
+            let filtered_w = upstream_mul_add(num.w, sample_val, z.w, fused);
+            z.z = upstream_mul_add(-den.z, filt_sample, filtered_w, fused);
         }
 
         if (i >= delay) {

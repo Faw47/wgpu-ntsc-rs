@@ -290,4 +290,59 @@ mod numerical {
         }
         assert!(failures.is_empty(), "parity failures: {failures:?}");
     }
+
+    #[test]
+    #[ignore = "requires a compute adapter, including software Vulkan"]
+    fn wide_recursive_filters_match_host_specific_upstream_arithmetic() {
+        let mut gpu = WgpuBackend::new().expect("adapter required");
+        eprintln!("ADAPTER {:?}", gpu.adapter_info);
+        let mut failures = Vec::new();
+
+        for width in [1919, 1920, 1921, 3839, 3840, 3841, 8192] {
+            let mut effect = clean();
+            effect.filter_type = FilterType::Butterworth;
+            effect.chroma_lowpass_out = ChromaLowpass::Full;
+            let error = diff(
+                &mut gpu,
+                &effect,
+                width,
+                3,
+                [0.125, 1.0],
+                "wide-chroma-lowpass-out",
+            );
+            if error > 0.002 {
+                failures.push(format!("lowpass-out/{width}: {error}"));
+            }
+        }
+
+        for width in [3839, 3840, 3841, 8192] {
+            let mut effect = clean();
+            effect.filter_type = FilterType::Butterworth;
+            effect.vhs_settings = Some(VHSSettings {
+                tape_speed: VHSTapeSpeed::EP,
+                chroma_loss: 0.0,
+                edge_wave: None,
+                sharpen: Some(VHSSharpenSettings {
+                    intensity: 5.0,
+                    frequency: 4.0,
+                }),
+            });
+            let error = diff(
+                &mut gpu,
+                &effect,
+                width,
+                3,
+                [1.0, 1.0],
+                "wide-vhs-butterworth-sharpen",
+            );
+            if error > 0.002 {
+                failures.push(format!("vhs-sharpen/{width}: {error}"));
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "wide recursive-filter parity failures: {failures:?}"
+        );
+    }
 }
