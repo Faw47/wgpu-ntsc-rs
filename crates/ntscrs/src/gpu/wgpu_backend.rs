@@ -8,6 +8,152 @@ use crate::{
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
+const IMAGE_STORAGE_BINDINGS: u32 = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameCapacityRequirements {
+    pub width: usize,
+    pub rows: usize,
+    pub pixels: u64,
+    pub plane_bytes: u64,
+    /// Size the former combined scratch representation would have required.
+    pub combined_plane_bytes: u64,
+}
+
+impl FrameCapacityRequirements {
+    pub fn new(width: usize, rows: usize) -> Result<Self, WgpuBackendError> {
+        if width == 0 || rows == 0 {
+            return Err(WgpuBackendError::InvalidDimensions { width, rows });
+        }
+        let pixels = u64::try_from(width)
+            .ok()
+            .and_then(|width| {
+                u64::try_from(rows)
+                    .ok()
+                    .and_then(|rows| width.checked_mul(rows))
+            })
+            .ok_or(WgpuBackendError::SizeOverflow { width, rows })?;
+        let plane_bytes = pixels
+            .checked_mul(std::mem::size_of::<f32>() as u64)
+            .ok_or(WgpuBackendError::SizeOverflow { width, rows })?;
+        let combined_plane_bytes = plane_bytes
+            .checked_mul(3)
+            .ok_or(WgpuBackendError::SizeOverflow { width, rows })?;
+        Ok(Self {
+            width,
+            rows,
+            pixels,
+            plane_bytes,
+            combined_plane_bytes,
+        })
+    }
+
+    pub fn validate(self, limits: &wgpu::Limits) -> Result<(), WgpuBackendError> {
+        if self.plane_bytes > u64::from(limits.max_storage_buffer_binding_size) {
+            return Err(WgpuBackendError::UnsupportedCapacity {
+                resource: "image plane storage binding",
+                required: self.plane_bytes,
+                supported: u64::from(limits.max_storage_buffer_binding_size),
+            });
+        }
+        if self.plane_bytes > limits.max_buffer_size {
+            return Err(WgpuBackendError::UnsupportedCapacity {
+                resource: "image plane buffer",
+                required: self.plane_bytes,
+                supported: limits.max_buffer_size,
+            });
+        }
+        if limits.max_storage_buffers_per_shader_stage < IMAGE_STORAGE_BINDINGS {
+            return Err(WgpuBackendError::UnsupportedCapacity {
+                resource: "storage buffers per shader stage",
+                required: u64::from(IMAGE_STORAGE_BINDINGS),
+                supported: u64::from(limits.max_storage_buffers_per_shader_stage),
+            });
+        }
+        let width_workgroups = u64::try_from(self.width).unwrap_or(u64::MAX).div_ceil(16);
+        let row_workgroups = u64::try_from(self.rows).unwrap_or(u64::MAX);
+        let supported = u64::from(limits.max_compute_workgroups_per_dimension);
+        if width_workgroups > supported {
+            return Err(WgpuBackendError::UnsupportedCapacity {
+                resource: "horizontal compute workgroups",
+                required: width_workgroups,
+                supported,
+            });
+        }
+        if row_workgroups > supported {
+            return Err(WgpuBackendError::UnsupportedCapacity {
+                resource: "row compute workgroups",
+                required: row_workgroups,
+                supported,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn storage_buffer_capacity(required: u64, limits: &wgpu::Limits) -> Result<u64, WgpuBackendError> {
+    let supported = u64::from(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
+    if required > supported {
+        return Err(WgpuBackendError::UnsupportedCapacity {
+            resource: "control-data storage binding",
+            required,
+            supported,
+        });
+    }
+    Ok(required
+        .checked_next_power_of_two()
+        .unwrap_or(required)
+        .min(supported))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WgpuBackendError {
+    Initialization(String),
+    InvalidDimensions {
+        width: usize,
+        rows: usize,
+    },
+    SizeOverflow {
+        width: usize,
+        rows: usize,
+    },
+    UnsupportedCapacity {
+        resource: &'static str,
+        required: u64,
+        supported: u64,
+    },
+    Runtime(String),
+    Readback(String),
+    DeviceLost(String),
+}
+
+impl std::fmt::Display for WgpuBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Initialization(message) => write!(f, "WGPU initialization failed: {message}"),
+            Self::InvalidDimensions { width, rows } => {
+                write!(f, "invalid WGPU frame dimensions {width}x{rows}")
+            }
+            Self::SizeOverflow { width, rows } => {
+                write!(f, "WGPU frame size overflow for {width}x{rows}")
+            }
+            Self::UnsupportedCapacity {
+                resource,
+                required,
+                supported,
+            } => write!(
+                f,
+                "WGPU {resource} requires {required} bytes/units, device supports {supported}"
+            ),
+            Self::Runtime(message) => write!(f, "WGPU runtime failure: {message}"),
+            Self::Readback(message) => write!(f, "WGPU readback failure: {message}"),
+            Self::DeviceLost(message) => write!(f, "WGPU device lost: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for WgpuBackendError {}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShaderParams {
@@ -53,8 +199,8 @@ pub struct WgpuFrame {
     pub y_buffer: wgpu::Buffer,
     pub i_buffer: wgpu::Buffer,
     pub q_buffer: wgpu::Buffer,
-    pub scratch_buffer: wgpu::Buffer,
-    pub staging_buffer: wgpu::Buffer,
+    pub scratch_buffers: [wgpu::Buffer; 3],
+    pub staging_buffers: [wgpu::Buffer; 3],
     pub main_bind_group: wgpu::BindGroup,
     pub i_pass_bind_group: wgpu::BindGroup,
     pub q_pass_bind_group: wgpu::BindGroup,
@@ -65,10 +211,12 @@ pub struct WgpuFrame {
     // Keep reference to the device/queue to easily do readbacks
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    runtime_errors: Arc<std::sync::Mutex<Vec<String>>>,
+    device_lost: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 pub struct PendingReadback {
-    receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    receivers: [std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>; 3],
 }
 
 impl GpuFrame for WgpuFrame {
@@ -88,50 +236,99 @@ impl WgpuFrame {
                 label: Some("download encoder"),
             });
 
-        encoder.copy_buffer_to_buffer(&self.y_buffer, 0, &self.staging_buffer, 0, size);
-        encoder.copy_buffer_to_buffer(&self.i_buffer, 0, &self.staging_buffer, size, size);
-        encoder.copy_buffer_to_buffer(&self.q_buffer, 0, &self.staging_buffer, size * 2, size);
+        for (source, staging) in [&self.y_buffer, &self.i_buffer, &self.q_buffer]
+            .into_iter()
+            .zip(&self.staging_buffers)
+        {
+            encoder.copy_buffer_to_buffer(source, 0, staging, 0, size);
+        }
 
         self.queue.submit(Some(encoder.finish()));
 
-        let buffer_slice = self.staging_buffer.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
-            let _ = sender.send(v);
+        let receivers = std::array::from_fn(|plane| {
+            let buffer_slice = self.staging_buffers[plane].slice(..);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
+                let _ = sender.send(v);
+            });
+            receiver
         });
 
-        PendingReadback { receiver }
+        PendingReadback { receivers }
+    }
+
+    pub fn try_finish_download(
+        &self,
+        dst: &mut YiqView,
+        pending: PendingReadback,
+    ) -> Result<(), WgpuBackendError> {
+        if (self.width, self.height) != (dst.dimensions.0, dst.num_rows()) {
+            return Err(WgpuBackendError::Readback(format!(
+                "destination is {}x{}, frame is {}x{}",
+                dst.dimensions.0,
+                dst.num_rows(),
+                self.width,
+                self.height
+            )));
+        }
+        if let Err(error) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
+            self.staging_buffers.iter().for_each(wgpu::Buffer::unmap);
+            return Err(WgpuBackendError::Runtime(error.to_string()));
+        }
+        let mut mapping_error = None;
+        for receiver in pending.receivers {
+            let result = receiver
+                .recv()
+                .map_err(|_| WgpuBackendError::Readback("mapping callback was dropped".to_owned()));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    mapping_error = Some(WgpuBackendError::Readback(error.to_string()));
+                }
+                Err(error) => mapping_error = Some(error),
+            }
+        }
+        if let Some(error) = mapping_error {
+            self.staging_buffers.iter().for_each(wgpu::Buffer::unmap);
+            return Err(error);
+        }
+        if let Some(error) = self
+            .device_lost
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            self.staging_buffers.iter().for_each(wgpu::Buffer::unmap);
+            return Err(WgpuBackendError::DeviceLost(error));
+        }
+        let runtime_errors = {
+            let mut errors = self
+                .runtime_errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *errors)
+        };
+        if !runtime_errors.is_empty() {
+            self.staging_buffers.iter().for_each(wgpu::Buffer::unmap);
+            return Err(WgpuBackendError::Runtime(runtime_errors.join("; ")));
+        }
+        let size = (self.width * self.height * std::mem::size_of::<f32>()) as u64;
+        for (staging, destination) in
+            self.staging_buffers
+                .iter()
+                .zip([&mut *dst.y, &mut *dst.i, &mut *dst.q])
+        {
+            let data = staging.slice(..size).get_mapped_range();
+            let source: &[f32] = bytemuck::cast_slice(&data);
+            destination[..source.len()].copy_from_slice(source);
+        }
+        self.staging_buffers.iter().for_each(wgpu::Buffer::unmap);
+        Ok(())
     }
 
     pub fn finish_download(&self, dst: &mut YiqView, pending: PendingReadback) {
-        assert_eq!(
-            (self.width, self.height),
-            (dst.dimensions.0, dst.num_rows())
-        );
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("GPU readback poll failed");
-        pending
-            .receiver
-            .recv()
-            .expect("GPU mapping callback was dropped")
-            .expect("GPU readback mapping failed");
-        let size = (self.width * self.height * std::mem::size_of::<f32>()) as u64;
-        let buffer_slice = self.staging_buffer.slice(..);
-        {
-            let data = buffer_slice.get_mapped_range();
-
-            // Split data into slices and copy
-            let y_src = bytemuck::cast_slice(&data[0..(size as usize)]);
-            let i_src = bytemuck::cast_slice(&data[(size as usize)..(size as usize * 2)]);
-            let q_src = bytemuck::cast_slice(&data[(size as usize * 2)..(size as usize * 3)]);
-
-            dst.y[..y_src.len()].copy_from_slice(y_src);
-            dst.i[..i_src.len()].copy_from_slice(i_src);
-            dst.q[..q_src.len()].copy_from_slice(q_src);
-        }
-
-        self.staging_buffer.unmap();
+        self.try_finish_download(dst, pending)
+            .expect("WGPU readback failed");
     }
 }
 
@@ -157,6 +354,13 @@ pub struct WgpuBackend {
     data_index: std::cell::Cell<usize>,
     filter_cache: std::cell::RefCell<std::collections::HashMap<[u32; 16], wgpu::BindGroup>>,
     pub adapter_info: wgpu::AdapterInfo,
+    pub adapter_limits: wgpu::Limits,
+    pub requested_limits: wgpu::Limits,
+    runtime_errors: Arc<std::sync::Mutex<Vec<String>>>,
+    pub(crate) device_lost: Arc<std::sync::Mutex<Option<String>>>,
+    dispatch_stages: std::cell::RefCell<Vec<&'static str>>,
+    cpu_control_stages: std::cell::RefCell<Vec<&'static str>>,
+    pending_error: std::cell::RefCell<Option<WgpuBackendError>>,
     submitted_effects: u64,
 }
 
@@ -177,11 +381,14 @@ impl WgpuBackend {
     }
 
     pub fn new() -> Option<Self> {
-        // Pollster block_on is needed to initialize async wgpu structs synchronously
+        Self::try_new().ok()
+    }
+
+    pub fn try_new() -> Result<Self, WgpuBackendError> {
         pollster::block_on(Self::init_async())
     }
 
-    async fn init_async() -> Option<Self> {
+    async fn init_async() -> Result<Self, WgpuBackendError> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
@@ -194,17 +401,40 @@ impl WgpuBackend {
                 ..Default::default()
             })
             .await
-            .ok()?;
+            .map_err(|error| WgpuBackendError::Initialization(error.to_string()))?;
+
+        let adapter_limits = adapter.limits();
+        let mut requested_limits = wgpu::Limits::default();
+        requested_limits.max_storage_buffer_binding_size =
+            adapter_limits.max_storage_buffer_binding_size;
+        requested_limits.max_buffer_size = adapter_limits.max_buffer_size;
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ntsc-rs wgpu device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: requested_limits.clone(),
                 ..Default::default()
             })
             .await
-            .ok()?;
+            .map_err(|error| WgpuBackendError::Initialization(error.to_string()))?;
+
+        let runtime_errors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime_errors_for_callback = runtime_errors.clone();
+        device.on_uncaptured_error(Arc::new(move |error| {
+            runtime_errors_for_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(error.to_string());
+        }));
+        let device_lost = Arc::new(std::sync::Mutex::new(None));
+        let device_lost_for_callback = device_lost.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            *device_lost_for_callback
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(format!("{reason:?}: {message}"));
+        });
 
         let chroma_into_luma_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chroma_into_luma shader"),
@@ -233,51 +463,21 @@ impl WgpuBackend {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/chroma_loss_blend.wgsl").into()),
         });
 
+        let image_layout_entries: [wgpu::BindGroupLayoutEntry; IMAGE_STORAGE_BINDINGS as usize] =
+            std::array::from_fn(|binding| wgpu::BindGroupLayoutEntry {
+                binding: binding as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
         let copy_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("copy bind group layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
+                entries: &image_layout_entries,
             });
 
         let params_bind_group_layout =
@@ -511,7 +711,7 @@ impl WgpuBackend {
             params_ring_buffer.push((buffer, bind_group));
         }
 
-        Some(Self {
+        Ok(Self {
             device: Arc::new(device),
             queue: Arc::new(queue),
             copy_bind_group_layout,
@@ -533,6 +733,13 @@ impl WgpuBackend {
             data_index: Default::default(),
             filter_cache: Default::default(),
             adapter_info: adapter.get_info(),
+            adapter_limits,
+            requested_limits,
+            runtime_errors,
+            device_lost,
+            dispatch_stages: Default::default(),
+            cpu_control_stages: Default::default(),
+            pending_error: Default::default(),
             submitted_effects: 0,
         })
     }
@@ -541,6 +748,50 @@ impl WgpuBackend {
     /// Readback-only submissions are deliberately excluded.
     pub fn submitted_effects(&self) -> u64 {
         self.submitted_effects
+    }
+
+    pub fn frame_capacity_requirements(
+        &self,
+        width: usize,
+        rows: usize,
+    ) -> Result<FrameCapacityRequirements, WgpuBackendError> {
+        let requirements = FrameCapacityRequirements::new(width, rows)?;
+        requirements.validate(&self.device.limits())?;
+        Ok(requirements)
+    }
+
+    fn record_dispatch(&self, stage: &'static str) {
+        self.dispatch_stages.borrow_mut().push(stage);
+    }
+
+    fn record_cpu_control(&self, stage: &'static str) {
+        self.cpu_control_stages.borrow_mut().push(stage);
+    }
+
+    pub fn execution_evidence(&self) -> (Vec<&'static str>, Vec<&'static str>) {
+        (
+            self.dispatch_stages.borrow().clone(),
+            self.cpu_control_stages.borrow().clone(),
+        )
+    }
+
+    pub fn begin_execution(&self) {
+        self.runtime_errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.pending_error.borrow_mut().take();
+    }
+
+    pub fn current_device_loss(&self) -> Option<String> {
+        self.device_lost
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn take_pending_error(&self) -> Option<WgpuBackendError> {
+        self.pending_error.borrow_mut().take()
     }
 
     fn dispatch_filter_plane<'a>(
@@ -553,6 +804,7 @@ impl WgpuBackend {
         delay: usize,
         plane_idx: u32,
     ) {
+        self.record_dispatch("filter_plane");
         let (num, den, z_initial) = tf.to_gpu_coeffs(if first_sample { 1.0 } else { 0.0 });
         let filter_coeffs = FilterCoeffs {
             num,
@@ -566,7 +818,7 @@ impl WgpuBackend {
 
         let key: [u32; 16] = bytemuck::cast(filter_coeffs);
         let mut cache = self.filter_cache.borrow_mut();
-        if cache.len() >= 256 {
+        if !cache.contains_key(&key) && cache.len() >= 256 {
             cache.clear();
         }
         let coeffs_bind_group = cache.entry(key).or_insert_with(|| {
@@ -610,23 +862,45 @@ impl WgpuBackend {
         entry: &'static str,
         data: &[u8],
     ) {
+        self.dispatch_shared_data(encoder, frame, params, main, &[entry], data);
+    }
+
+    fn dispatch_shared_data(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &WgpuFrame,
+        params: &wgpu::BindGroup,
+        main: &wgpu::BindGroup,
+        entries: &[&'static str],
+        data: &[u8],
+    ) {
         if data.is_empty() {
+            return;
+        }
+        if self.pending_error.borrow().is_some() {
             return;
         }
         let index = self.data_index.get();
         self.data_index.set(index + 1);
         let mut cache = self.data_cache.borrow_mut();
         let size = data.len() as u64;
+        let limits = self.device.limits();
+        let capacity = match storage_buffer_capacity(size, &limits) {
+            Ok(capacity) => capacity,
+            Err(error) => {
+                *self.pending_error.borrow_mut() = Some(error);
+                return;
+            }
+        };
         if index >= cache.len() || cache[index].2 < size {
-            let capacity = size.next_power_of_two();
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(entry),
+                label: entries.first().copied(),
                 size: capacity,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(entry),
+                label: entries.first().copied(),
                 layout: &self.row_layout,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
@@ -642,19 +916,26 @@ impl WgpuBackend {
         }
         let (buffer, group, _) = &cache[index];
         self.queue.write_buffer(buffer, 0, data);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some(entry),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.row_pipelines[entry]);
-        pass.set_bind_group(0, main, &[]);
-        pass.set_bind_group(1, params, &[]);
-        pass.set_bind_group(2, group, &[]);
-        pass.dispatch_workgroups(
-            (frame.width as u32).div_ceil(16),
-            (frame.height as u32).div_ceil(16),
-            1,
-        );
+        for &entry in entries {
+            self.record_dispatch(entry);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(entry),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.row_pipelines[entry]);
+            pass.set_bind_group(0, main, &[]);
+            pass.set_bind_group(1, params, &[]);
+            pass.set_bind_group(2, group, &[]);
+            if entry == "noise" {
+                pass.dispatch_workgroups(1, frame.height as u32, 1);
+            } else {
+                pass.dispatch_workgroups(
+                    (frame.width as u32).div_ceil(16),
+                    (frame.height as u32).div_ceil(16),
+                    1,
+                );
+            }
+        }
     }
 
     fn dispatch_chroma_lowpass(
@@ -711,8 +992,10 @@ impl GpuBackend for WgpuBackend {
     type Frame = WgpuFrame;
 
     fn upload_frame(&mut self, src: &YiqView) -> Self::Frame {
-        let size =
-            (src.dimensions.0 * src.num_rows() * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+        let requirements = self
+            .frame_capacity_requirements(src.dimensions.0, src.num_rows())
+            .expect("WGPU frame capacity must be validated before allocation");
+        let size = requirements.plane_bytes;
 
         let create_buffer = |label: &str, data: &[f32]| {
             let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -731,121 +1014,59 @@ impl GpuBackend for WgpuBackend {
         let y_buffer = create_buffer("y_buffer", src.y);
         let i_buffer = create_buffer("i_buffer", src.i);
         let q_buffer = create_buffer("q_buffer", src.q);
-        // Snapshot up to three planes for race-free pixel-parallel spatial effects.
-        let scratch_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("scratch_buffer"),
-            size: size * 3,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let scratch_buffers = std::array::from_fn(|plane| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(["scratch_y", "scratch_i", "scratch_q"][plane]),
+                size,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let staging_buffers = std::array::from_fn(|plane| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(["readback_y", "readback_i", "readback_q"][plane]),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
         });
 
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback staging buffer"),
-            size: size * 3, // scratch is working memory, not image output
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let main_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("main bind group"),
-            layout: &self.copy_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: y_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: i_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: q_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: scratch_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let i_pass_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("i pass bind group"),
-            layout: &self.copy_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: i_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: y_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: q_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: scratch_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let q_pass_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("q pass bind group"),
-            layout: &self.copy_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: q_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: y_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: i_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: scratch_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        let chroma_loss_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("chroma loss bind group"),
-            layout: &self.copy_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: i_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: q_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: y_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: scratch_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let make_bind_group = |label, images: [&wgpu::Buffer; 3]| {
+            let resources = [
+                images[0],
+                images[1],
+                images[2],
+                &scratch_buffers[0],
+                &scratch_buffers[1],
+                &scratch_buffers[2],
+            ];
+            let entries: [wgpu::BindGroupEntry; IMAGE_STORAGE_BINDINGS as usize] =
+                std::array::from_fn(|binding| wgpu::BindGroupEntry {
+                    binding: binding as u32,
+                    resource: resources[binding].as_entire_binding(),
+                });
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &self.copy_bind_group_layout,
+                entries: &entries,
+            })
+        };
+        let main_bind_group = make_bind_group("main bind group", [&y_buffer, &i_buffer, &q_buffer]);
+        let i_pass_bind_group =
+            make_bind_group("i pass bind group", [&i_buffer, &y_buffer, &q_buffer]);
+        let q_pass_bind_group =
+            make_bind_group("q pass bind group", [&q_buffer, &y_buffer, &i_buffer]);
+        let chroma_loss_bind_group =
+            make_bind_group("chroma loss bind group", [&i_buffer, &q_buffer, &y_buffer]);
 
         WgpuFrame {
             y_buffer,
             i_buffer,
             q_buffer,
-            scratch_buffer,
-            staging_buffer,
+            scratch_buffers,
+            staging_buffers,
             main_bind_group,
             i_pass_bind_group,
             q_pass_bind_group,
@@ -855,6 +1076,8 @@ impl GpuBackend for WgpuBackend {
             full_height: src.dimensions.1,
             device: self.device.clone(),
             queue: self.queue.clone(),
+            runtime_errors: self.runtime_errors.clone(),
+            device_lost: self.device_lost.clone(),
         }
     }
 
@@ -866,6 +1089,8 @@ impl GpuBackend for WgpuBackend {
         scale_factor: [f32; 2],
     ) {
         self.data_index.set(0);
+        self.dispatch_stages.borrow_mut().clear();
+        self.cpu_control_stages.borrow_mut().clear();
         use super::prepare;
         let size = (frame.width * frame.height * std::mem::size_of::<f32>()) as u64;
         let mut ring_idx = 0;
@@ -929,6 +1154,7 @@ impl GpuBackend for WgpuBackend {
                 0,
             ),
             LumaLowpass::Box => {
+                self.record_dispatch("luma_box");
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                 pass.set_pipeline(&self.luma_box_pipeline);
                 pass.set_bind_group(0, main_bind_group, &[]);
@@ -946,13 +1172,14 @@ impl GpuBackend for WgpuBackend {
         );
 
         {
+            self.record_dispatch("chroma_into_luma");
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("chroma_into_luma pass"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.chroma_into_luma_pipeline);
             cpass.set_bind_group(0, main_bind_group, &[]);
-            cpass.set_bind_group(1, self.get_params_bind_group(&params, &mut ring_idx), &[]);
+            cpass.set_bind_group(1, base_params, &[]);
             cpass.dispatch_workgroups(pixel_workgroups.0, pixel_workgroups.1, 1);
         }
 
@@ -968,6 +1195,7 @@ impl GpuBackend for WgpuBackend {
         let sx = params.horizontal_scale;
         let sy = params.vertical_scale;
         if let Some(noise) = &effect.composite_noise {
+            self.record_cpu_control("composite_noise_rows");
             let rows = prepare::noise(
                 effect.random_seed,
                 frame_num,
@@ -987,6 +1215,7 @@ impl GpuBackend for WgpuBackend {
             );
         }
         if effect.snow_intensity > 0.0 && sx > 0.0 {
+            self.record_cpu_control("snow_events_and_values");
             let events = prepare::snow(
                 effect.random_seed,
                 frame_num,
@@ -1006,6 +1235,7 @@ impl GpuBackend for WgpuBackend {
             );
         }
         if let Some(head) = &effect.head_switching {
+            self.record_cpu_control("head_switching_rows");
             let rows = prepare::head(
                 effect.random_seed,
                 frame_num,
@@ -1015,7 +1245,7 @@ impl GpuBackend for WgpuBackend {
                 sy,
                 head,
             );
-            encoder.copy_buffer_to_buffer(&frame.y_buffer, 0, &frame.scratch_buffer, 0, size);
+            encoder.copy_buffer_to_buffer(&frame.y_buffer, 0, &frame.scratch_buffers[0], 0, size);
             self.dispatch_data(
                 &mut encoder,
                 frame,
@@ -1026,6 +1256,7 @@ impl GpuBackend for WgpuBackend {
             );
         }
         if let Some(tracking) = &effect.tracking_noise {
+            self.record_cpu_control("tracking_displacement_noise_and_snow");
             let (rows, events) = prepare::tracking(
                 effect.random_seed,
                 frame_num,
@@ -1035,21 +1266,13 @@ impl GpuBackend for WgpuBackend {
                 sy,
                 tracking,
             );
-            encoder.copy_buffer_to_buffer(&frame.y_buffer, 0, &frame.scratch_buffer, 0, size);
-            self.dispatch_data(
+            encoder.copy_buffer_to_buffer(&frame.y_buffer, 0, &frame.scratch_buffers[0], 0, size);
+            self.dispatch_shared_data(
                 &mut encoder,
                 frame,
                 base_params,
                 main_bind_group,
-                "shift_y",
-                bytemuck::cast_slice(&rows),
-            );
-            self.dispatch_data(
-                &mut encoder,
-                frame,
-                base_params,
-                main_bind_group,
-                "noise",
+                &["shift_y", "noise"],
                 bytemuck::cast_slice(&rows),
             );
             self.dispatch_data(
@@ -1063,7 +1286,7 @@ impl GpuBackend for WgpuBackend {
         }
 
         let size = (num_pixels * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
-        encoder.copy_buffer_to_buffer(&frame.y_buffer, 0, &frame.scratch_buffer, 0, size);
+        encoder.copy_buffer_to_buffer(&frame.y_buffer, 0, &frame.scratch_buffers[0], 0, size);
 
         params.phase_shift = effect.video_scanline_phase_shift as u32;
         params.phase_offset = effect.video_scanline_phase_shift_offset;
@@ -1078,7 +1301,7 @@ impl GpuBackend for WgpuBackend {
         } else {
             effect.chroma_demodulation
         };
-        let demod_params = self.get_params_bind_group(&params, &mut ring_idx);
+        let demod_params = base_params;
         if demodulation == ChromaDemodulationFilter::Notch {
             self.dispatch_filter_plane(
                 &mut encoder,
@@ -1091,6 +1314,7 @@ impl GpuBackend for WgpuBackend {
             );
         }
         {
+            self.record_dispatch("luma_into_chroma");
             let pipeline = match demodulation {
                 ChromaDemodulationFilter::Box => &self.luma_into_chroma_box_pipeline,
                 ChromaDemodulationFilter::Notch => &self.luma_into_chroma_notch_pipeline,
@@ -1120,6 +1344,7 @@ impl GpuBackend for WgpuBackend {
         }
 
         if let Some(noise) = &effect.luma_noise {
+            self.record_cpu_control("luma_noise_rows");
             let rows = prepare::noise(
                 effect.random_seed,
                 frame_num,
@@ -1143,6 +1368,11 @@ impl GpuBackend for WgpuBackend {
                 (noise_seeds::VIDEO_CHROMA_I, &frame.i_pass_bind_group),
                 (noise_seeds::VIDEO_CHROMA_Q, &frame.q_pass_bind_group),
             ] {
+                self.record_cpu_control(if tag == noise_seeds::VIDEO_CHROMA_I {
+                    "chroma_i_noise_rows"
+                } else {
+                    "chroma_q_noise_rows"
+                });
                 let rows = prepare::noise(
                     effect.random_seed,
                     frame_num,
@@ -1164,6 +1394,7 @@ impl GpuBackend for WgpuBackend {
         }
 
         if effect.chroma_phase_error > 0.0 {
+            self.record_dispatch("chroma_phase_error");
             params.noise_frequency = effect.chroma_phase_error;
             params.noise_intensity = 0.0;
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
@@ -1174,6 +1405,7 @@ impl GpuBackend for WgpuBackend {
         }
 
         if effect.chroma_phase_noise_intensity > 0.0 {
+            self.record_cpu_control("chroma_phase_noise_rows");
             let rows = prepare::phase(
                 effect.random_seed,
                 frame_num,
@@ -1191,12 +1423,13 @@ impl GpuBackend for WgpuBackend {
         }
 
         if effect.chroma_delay_horizontal != 0.0 || effect.chroma_delay_vertical != 0 {
+            self.record_dispatch("chroma_delay");
             params.chroma_delay_horizontal =
                 effect.chroma_delay_horizontal * params.horizontal_scale;
             params.chroma_delay_vertical =
                 (effect.chroma_delay_vertical as f32 * params.vertical_scale).round() as i32;
-            encoder.copy_buffer_to_buffer(&frame.i_buffer, 0, &frame.scratch_buffer, 0, size);
-            encoder.copy_buffer_to_buffer(&frame.q_buffer, 0, &frame.scratch_buffer, size, size);
+            encoder.copy_buffer_to_buffer(&frame.i_buffer, 0, &frame.scratch_buffers[1], 0, size);
+            encoder.copy_buffer_to_buffer(&frame.q_buffer, 0, &frame.scratch_buffers[2], 0, size);
 
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("chroma_delay pass"),
@@ -1212,6 +1445,7 @@ impl GpuBackend for WgpuBackend {
             if let Some(wave) = &vhs_settings.edge_wave
                 && wave.intensity > 0.0
             {
+                self.record_cpu_control("vhs_edge_wave_displacement");
                 let rows = prepare::wave(effect.random_seed, frame_num, frame.height, sx, sy, wave);
                 for (plane, buffer) in [&frame.y_buffer, &frame.i_buffer, &frame.q_buffer]
                     .into_iter()
@@ -1220,8 +1454,8 @@ impl GpuBackend for WgpuBackend {
                     encoder.copy_buffer_to_buffer(
                         buffer,
                         0,
-                        &frame.scratch_buffer,
-                        size * plane as u64,
+                        &frame.scratch_buffers[plane],
+                        0,
                         size,
                     );
                 }
@@ -1264,6 +1498,7 @@ impl GpuBackend for WgpuBackend {
             }
 
             if vhs_settings.chroma_loss > 0.0 {
+                self.record_cpu_control("chroma_loss_rows");
                 let rows = prepare::loss(
                     effect.random_seed,
                     frame_num,
@@ -1298,6 +1533,7 @@ impl GpuBackend for WgpuBackend {
         }
 
         if effect.chroma_vert_blend && frame.full_height >= 2 {
+            self.record_dispatch("chroma_vert_blend");
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("chroma_vert_blend pass"),
                 timestamp_writes: None,
@@ -1317,7 +1553,108 @@ impl GpuBackend for WgpuBackend {
             params.horizontal_scale,
         );
 
+        if self.pending_error.borrow().is_some() {
+            return;
+        }
         self.queue.submit(Some(encoder.finish()));
         self.submitted_effects += 1;
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn split_plane_requirements_cover_large_progressive_and_field_frames() {
+        let progressive = FrameCapacityRequirements::new(7680, 4320).unwrap();
+        assert_eq!(progressive.plane_bytes, 132_710_400);
+        assert_eq!(progressive.combined_plane_bytes, 398_131_200);
+        progressive.validate(&wgpu::Limits::default()).unwrap();
+
+        let field = FrameCapacityRequirements::new(7680, 2160).unwrap();
+        assert_eq!(field.plane_bytes, 66_355_200);
+        assert_eq!(field.combined_plane_bytes, 199_065_600);
+        field.validate(&wgpu::Limits::default()).unwrap();
+    }
+
+    #[test]
+    fn capacity_rejects_each_relevant_limit_before_allocation() {
+        let too_wide = FrameCapacityRequirements::new(8192, 4320).unwrap();
+        assert_eq!(too_wide.plane_bytes, 141_557_760);
+        assert!(matches!(
+            too_wide.validate(&wgpu::Limits::default()),
+            Err(WgpuBackendError::UnsupportedCapacity {
+                resource: "image plane storage binding",
+                ..
+            })
+        ));
+
+        let requirement = FrameCapacityRequirements::new(64, 64).unwrap();
+        let mut limits = wgpu::Limits::default();
+        limits.max_storage_buffer_binding_size = u32::MAX;
+        limits.max_buffer_size = requirement.plane_bytes - 1;
+        assert!(matches!(
+            requirement.validate(&limits),
+            Err(WgpuBackendError::UnsupportedCapacity {
+                resource: "image plane buffer",
+                ..
+            })
+        ));
+
+        let mut limits = wgpu::Limits::default();
+        limits.max_storage_buffers_per_shader_stage = IMAGE_STORAGE_BINDINGS - 1;
+        assert!(matches!(
+            requirement.validate(&limits),
+            Err(WgpuBackendError::UnsupportedCapacity {
+                resource: "storage buffers per shader stage",
+                ..
+            })
+        ));
+
+        let mut limits = wgpu::Limits::default();
+        limits.max_compute_workgroups_per_dimension = 1;
+        assert!(matches!(
+            requirement.validate(&limits),
+            Err(WgpuBackendError::UnsupportedCapacity {
+                resource: "horizontal compute workgroups",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn capacity_arithmetic_is_checked() {
+        assert!(matches!(
+            FrameCapacityRequirements::new(0, 1),
+            Err(WgpuBackendError::InvalidDimensions { .. })
+        ));
+        assert!(matches!(
+            FrameCapacityRequirements::new(usize::MAX, usize::MAX),
+            Err(WgpuBackendError::SizeOverflow { .. })
+        ));
+    }
+
+    #[test]
+    fn control_buffer_capacity_is_checked_and_bounded() {
+        let mut limits = wgpu::Limits::default();
+        limits.max_storage_buffer_binding_size = 1_000;
+        limits.max_buffer_size = 2_000;
+
+        assert_eq!(storage_buffer_capacity(513, &limits).unwrap(), 1_000);
+        assert_eq!(storage_buffer_capacity(1_000, &limits).unwrap(), 1_000);
+        assert!(matches!(
+            storage_buffer_capacity(1_001, &limits),
+            Err(WgpuBackendError::UnsupportedCapacity {
+                resource: "control-data storage binding",
+                required: 1_001,
+                supported: 1_000,
+            })
+        ));
+
+        limits.max_storage_buffer_binding_size = 4_096;
+        limits.max_buffer_size = 1_500;
+        assert_eq!(storage_buffer_capacity(1_024, &limits).unwrap(), 1_024);
+        assert_eq!(storage_buffer_capacity(1_025, &limits).unwrap(), 1_500);
     }
 }

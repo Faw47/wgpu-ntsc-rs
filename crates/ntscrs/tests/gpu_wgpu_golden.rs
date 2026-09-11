@@ -119,6 +119,17 @@ fn deterministic_effect_matrix_matches_cpu() {
             cases.push((label, effect));
         }
     }
+    for filter in [FilterType::Butterworth, FilterType::ConstantK] {
+        let mut effect = clean_effect();
+        effect.filter_type = filter;
+        effect.chroma_lowpass_in = ChromaLowpass::Full;
+        cases.push(("chroma-lowpass-in-only", effect));
+
+        let mut effect = clean_effect();
+        effect.filter_type = filter;
+        effect.chroma_lowpass_out = ChromaLowpass::Full;
+        cases.push(("chroma-lowpass-out-only", effect));
+    }
     let mut effect = clean_effect();
     effect.composite_sharpening = 1.0;
     cases.push(("composite-sharpen", effect));
@@ -212,9 +223,9 @@ fn alternating_field_selection_matches_cpu_for_both_parities() {
         assert_eq!(
             field,
             if frame_num % 2 == 0 {
-                YiqField::Upper
-            } else {
                 YiqField::Lower
+            } else {
+                YiqField::Upper
             }
         );
         let dimensions = (65, 33);
@@ -227,7 +238,11 @@ fn alternating_field_selection_matches_cpu_for_both_parities() {
         effect.apply_effect_to_yiq(&mut cpu, frame_num, [1.0, 1.0]);
         let mut actual = YiqView::from_parts(&mut input, dimensions, field);
         let submissions_before = runner.wgpu_submitted_effects();
-        runner.apply_effect(&mut actual, &effect, frame_num, [1.0, 1.0]);
+        let execution = runner
+            .apply_effect(&mut actual, &effect, frame_num, [1.0, 1.0])
+            .unwrap();
+        assert_eq!(execution.cpu_image_effect_invocations, 0);
+        assert!(!execution.dispatched_stages.is_empty());
         assert_eq!(runner.last_backend(), BackendType::Wgpu);
         assert!(runner.fallback_reason().is_none());
         assert!(runner.wgpu_submitted_effects() > submissions_before);
@@ -263,6 +278,9 @@ fn stochastic_effects_and_complete_presets_match_cpu() {
     e.snow_intensity = 50.0;
     cases.push(("dense-snow", e));
     let mut e = clean_effect();
+    e.snow_intensity = f32::EPSILON;
+    cases.push(("near-zero-snow-event-walk", e));
+    let mut e = clean_effect();
     e.chroma_phase_noise_intensity = 0.3;
     cases.push(("phase-noise", e));
     let mut e = clean_effect();
@@ -276,6 +294,14 @@ fn stochastic_effects_and_complete_presets_match_cpu() {
         edge_wave: None,
     });
     cases.push(("loss", e));
+    let mut e = clean_effect();
+    e.vhs_settings = Some(VHSSettings {
+        tape_speed: VHSTapeSpeed::NONE,
+        chroma_loss: f32::EPSILON,
+        sharpen: None,
+        edge_wave: None,
+    });
+    cases.push(("near-zero-loss-event-walk", e));
     for (label, mut effect) in cases {
         for seed in [0, -47, i32::MAX] {
             effect.random_seed = seed;
@@ -320,7 +346,11 @@ fn field_modes_and_reused_buffers_match_cpu() {
                 effect.apply_effect_to_yiq(&mut cpu_view, frame, [1.25, 0.75]);
                 let mut gpu_view = YiqView::from_parts(&mut input, (width, height), field);
                 let submissions_before = runner.wgpu_submitted_effects();
-                runner.apply_effect(&mut gpu_view, &effect, frame, [1.25, 0.75]);
+                let execution = runner
+                    .apply_effect(&mut gpu_view, &effect, frame, [1.25, 0.75])
+                    .unwrap();
+                assert_eq!(execution.cpu_image_effect_invocations, 0);
+                assert!(!execution.dispatched_stages.is_empty());
                 assert_eq!(runner.last_backend(), BackendType::Wgpu);
                 assert!(runner.fallback_reason().is_none());
                 assert!(runner.wgpu_submitted_effects() > submissions_before);
@@ -351,14 +381,96 @@ fn application_wgpu_selection_renders_complete_effect() {
     for frame in [0, 3] {
         let mut data = vec![0.2; YiqView::buf_length_for((64, 32), YiqField::InterleavedUpper)];
         let mut view = YiqView::from_parts(&mut data, (64, 32), YiqField::InterleavedUpper);
-        let backend = apply_effect_to_yiq_with_backend_preference(
+        let execution = apply_effect_to_yiq_with_backend_preference(
             &effect,
             &mut view,
             frame,
             [1.0, 1.0],
             BackendPreference::Wgpu,
-        );
-        assert_eq!(backend, BackendType::Wgpu);
+        )
+        .unwrap();
+        assert_eq!(execution.requested, BackendType::Wgpu);
+        assert_eq!(execution.actual, BackendType::Wgpu);
+        assert_eq!(execution.cpu_image_effect_invocations, 0);
+        assert!(!execution.dispatched_stages.is_empty());
+        for stage in [
+            "chroma_into_luma",
+            "luma_into_chroma",
+            "noise",
+            "snow",
+            "shift_y",
+        ] {
+            assert!(
+                execution.dispatched_stages.contains(&stage),
+                "default stack did not dispatch {stage}: {:?}",
+                execution.dispatched_stages
+            );
+        }
+        for control in [
+            "snow_events_and_values",
+            "tracking_displacement_noise_and_snow",
+            "vhs_edge_wave_displacement",
+        ] {
+            assert!(
+                execution.cpu_control_stages.contains(&control),
+                "default stack did not prepare {control}: {:?}",
+                execution.cpu_control_stages
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a compute adapter"]
+fn tiny_field_and_interleaved_dimensions_match_cpu() {
+    use ntsc_rs::gpu::{BackendType, runner::NtscEffectRunner};
+    let mut runner = NtscEffectRunner::new(BackendType::Wgpu);
+    assert_eq!(runner.active_backend(), BackendType::Wgpu);
+    let mut effect = NtscEffect::default();
+    // Pinned upstream's CPU chroma blend requires a two-row scratch window and
+    // panics for a one-row selected field. Exercise tiny field packing without
+    // changing that upstream limitation.
+    effect.chroma_vert_blend = false;
+
+    for field in [
+        YiqField::Upper,
+        YiqField::Lower,
+        YiqField::InterleavedUpper,
+        YiqField::InterleavedLower,
+    ] {
+        for dimensions in [(1, 1), (1, 2), (2, 1), (2, 3), (3, 2)] {
+            let mut actual = vec![0.2; YiqView::buf_length_for(dimensions, field)];
+            let mut expected = actual.clone();
+            effect.apply_effect_to_yiq(
+                &mut YiqView::from_parts(&mut expected, dimensions, field),
+                1,
+                [1.0, 1.0],
+            );
+            let execution = runner
+                .apply_effect(
+                    &mut YiqView::from_parts(&mut actual, dimensions, field),
+                    &effect,
+                    1,
+                    [1.0, 1.0],
+                )
+                .unwrap();
+            assert_eq!(execution.actual, BackendType::Wgpu);
+            assert_eq!(execution.cpu_image_effect_invocations, 0);
+            let expected_view = YiqView::from_parts(&mut expected, dimensions, field);
+            let actual_view = YiqView::from_parts(&mut actual, dimensions, field);
+            for (plane, cpu, gpu) in [
+                ("Y", expected_view.y, actual_view.y),
+                ("I", expected_view.i, actual_view.i),
+                ("Q", expected_view.q, actual_view.q),
+            ] {
+                for (index, (&cpu, &gpu)) in cpu.iter().zip(gpu.iter()).enumerate() {
+                    assert!(
+                        cpu.is_finite() && gpu.is_finite() && (cpu - gpu).abs() <= 0.002,
+                        "{field:?} {dimensions:?} {plane}[{index}]: {cpu} vs {gpu}"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -387,7 +499,9 @@ fn full_default_rgb_fixture_matches_cpu() {
         let mut runner = NtscEffectRunner::new(backend);
         let mut data = input.clone();
         let mut view = YiqView::from_parts(&mut data, dimensions, field);
-        runner.apply_effect(&mut view, &effect, 7, [1.0, 1.0]);
+        runner
+            .apply_effect(&mut view, &effect, 7, [1.0, 1.0])
+            .unwrap();
         assert_eq!(runner.last_backend(), backend);
         let mut rgb = vec![0; image.as_raw().len()];
         view.write_to_strided_buffer::<Rgb, u8, _>(&mut rgb, blit, DeinterlaceMode::Bob, ());

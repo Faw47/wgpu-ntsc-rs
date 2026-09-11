@@ -1208,19 +1208,23 @@ impl Settings for NtscEffectFullSettings {
                 settings: FbmNoiseSettings {
                     frequency: 0.25, // added in v0.7.0
                     detail: 1,       // added in v0.7.0
-                    ..Default::default()
+                    intensity: 0.05,
                 },
             },
             luma_noise: SettingsBlock {
                 enabled: false,
-                settings: Default::default(),
+                settings: FbmNoiseSettings {
+                    frequency: 0.5,
+                    intensity: 0.01,
+                    detail: 1,
+                },
             }, // added in v0.7.0
             chroma_noise: SettingsBlock {
                 enabled: true,
                 settings: FbmNoiseSettings {
                     frequency: 0.05, // added in v0.5.1
                     detail: 1,       // added in v0.5.1
-                    ..Default::default()
+                    intensity: 0.1,
                 },
             },
             vhs_settings: SettingsBlock {

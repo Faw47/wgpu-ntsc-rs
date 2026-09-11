@@ -6,6 +6,21 @@ mod simplex;
 
 pub use simplex::{simplex_1d, simplex_2d};
 
+#[cfg(feature = "gpu-wgpu")]
+#[inline(always)]
+fn f32_lane_count_inner<S: Simd>(_: S) -> usize {
+    S::f32s::N
+}
+
+/// Return the f32 lane count selected by fearless_simd on this CPU.
+///
+/// The upstream sampling recurrence advances one coordinate vector at a time, so its
+/// observable f32 sample positions depend on this runtime-selected width.
+#[cfg(feature = "gpu-wgpu")]
+pub(crate) fn active_f32_lane_count() -> usize {
+    dispatch!(Level::new(), simd => f32_lane_count_inner(simd))
+}
+
 pub trait Noise<BaseNoise: Sampleable> {
     fn generate<S: Simd>(
         &self,

@@ -481,13 +481,20 @@ impl Plugin {
         } else {
             [in_data.downsample_x(), in_data.downsample_y()].map(|factor| factor.into())
         };
-        apply_effect_to_yiq_with_backend_preference(
+        let execution = apply_effect_to_yiq_with_backend_preference(
             &effect,
             &mut view,
             frame_num,
             scale_factors,
             backend_preference_for_plugin().unwrap_or_default(),
-        );
+        )
+        .map_err(|error| {
+            eprintln!("ntsc-rs: {error}");
+            Error::Generic
+        })?;
+        if let Some(reason) = execution.fallback_reason {
+            eprintln!("ntsc-rs: {reason}");
+        }
 
         match out_pixel_format {
             NtscrsPixelFormat::Xrgb8 => {

@@ -1201,13 +1201,20 @@ impl<'a> EffectApplicationParams<'a> {
             yiq_view.set_from_strided_buffer_maybe_uninit::<S, T, _>(srcData, blit_info, ());
         }
 
-        apply_effect_to_yiq_with_backend_preference(
+        let execution = apply_effect_to_yiq_with_backend_preference(
             self.effect,
             &mut yiq_view,
             self.frame_num,
             self.proxy_scale,
             backend_preference_for_plugin().unwrap_or_default(),
-        );
+        )
+        .map_err(|error| {
+            eprintln!("ntsc-rs: {error}");
+            OfxStat::kOfxStatFailed
+        })?;
+        if let Some(reason) = execution.fallback_reason {
+            eprintln!("ntsc-rs: {reason}");
+        }
 
         Ok(EffectStorageParams {
             yiq_data: ntsc_buf,

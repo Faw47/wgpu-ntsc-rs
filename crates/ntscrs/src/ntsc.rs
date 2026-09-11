@@ -16,6 +16,16 @@ use crate::{
     },
 };
 
+#[cfg(feature = "gpu-wgpu")]
+thread_local! {
+    static CPU_IMAGE_EFFECT_INVOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "gpu-wgpu")]
+pub(crate) fn cpu_image_effect_invocations() -> u64 {
+    CPU_IMAGE_EFFECT_INVOCATIONS.get()
+}
+
 // 315/88 Mhz rate * 4
 // TODO: why do we multiply by 4? composite-video-simulator does this for every filter and ntscqt defines NTSC_RATE the
 // same way as we do here.
@@ -1524,6 +1534,8 @@ impl NtscEffect {
 
     /// Apply the effect to YIQ image data.
     pub fn apply_effect_to_yiq(&self, yiq: &mut YiqView, frame_num: usize, scale_factor: [f32; 2]) {
+        #[cfg(feature = "gpu-wgpu")]
+        CPU_IMAGE_EFFECT_INVOCATIONS.set(CPU_IMAGE_EFFECT_INVOCATIONS.get() + 1);
         with_thread_pool(|| self.apply_effect_cpu_to_all_fields(yiq, frame_num, scale_factor));
     }
 

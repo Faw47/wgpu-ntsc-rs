@@ -1,7 +1,9 @@
 @group(0) @binding(0) var<storage, read_write> y_plane: array<f32>;
 @group(0) @binding(1) var<storage, read_write> i_plane: array<f32>;
 @group(0) @binding(2) var<storage, read_write> q_plane: array<f32>;
-@group(0) @binding(3) var<storage, read_write> scratch: array<f32>;
+@group(0) @binding(3) var<storage, read_write> scratch_y: array<f32>;
+@group(0) @binding(4) var<storage, read_write> scratch_i: array<f32>;
+@group(0) @binding(5) var<storage, read_write> scratch_q: array<f32>;
 struct ShaderParams {
     width: u32,
     frame_num: u32,
@@ -32,30 +34,50 @@ struct ShaderParams {
 fn rf(row: u32, field: u32) -> f32 {return bitcast<f32>(data[row * 12u + field]);}
 fn ru(row: u32, field: u32) -> u32 {return data[row * 12u + field];}
 fn valid(id: vec3<u32>) -> bool { return id.x < params.width && id.y < arrayLength(&y_plane) / params.width; }
+fn scratch_value(plane: u32, index: u32) -> f32 {
+    if (plane == 0u) { return scratch_y[index]; }
+    if (plane == 1u) { return scratch_i[index]; }
+    return scratch_q[index];
+}
 
-@compute @workgroup_size(16, 16, 1)
-fn noise(@builtin(global_invocation_id) id: vec3<u32>) {
-    if (!valid(id) || rf(id.y, 3u) == 0.0) {return;}
-    let index = id.y * params.width + id.x;
-    let value = fbm_1d(bitcast<i32>(ru(id.y, 1u)), ru(id.y, 5u), 1.0, 2.0,
-        rf(id.y, 4u), f32(id.x) + rf(id.y, 2u));
-    y_plane[index] += value * rf(id.y, 3u);
+@compute @workgroup_size(16, 1, 1)
+fn noise(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(local_invocation_id) local: vec3<u32>,
+) {
+    if (id.y >= arrayLength(&y_plane) / params.width || rf(id.y, 3u) == 0.0) {return;}
+    let lanes = ru(id.y, 11u);
+    if (lanes == 0u || local.x >= lanes) {return;}
+
+    // Upstream initializes SIMD lanes as offset + lane and advances each lane by
+    // repeated f32 additions of the selected CPU SIMD width. A direct offset + x
+    // changes sample positions after enough iterations due to f32 rounding.
+    var x = local.x;
+    var coordinate = rf(id.y, 2u) + f32(local.x);
+    while (x < params.width) {
+        let index = id.y * params.width + x;
+        let value = fbm_1d(bitcast<i32>(ru(id.y, 1u)), ru(id.y, 5u), 1.0, 2.0,
+            rf(id.y, 4u), coordinate);
+        y_plane[index] += value * rf(id.y, 3u);
+        x += lanes;
+        coordinate += f32(lanes);
+    }
 }
 fn shifted(id: vec3<u32>, plane: u32) -> f32 {
     let shift = rf(id.y, 0u);
-    let base = plane * arrayLength(&y_plane) + id.y * params.width;
+    let base = id.y * params.width;
     let source = f32(id.x) - shift;
     let left = i32(floor(source));
     let right = left + 1;
     let fraction = source - f32(left);
     var boundary = 0.0;
     if (ru(id.y, 10u) != 0u) {
-        boundary = scratch[base + select(params.width - 1u, 0u, shift >= 0.0)];
+        boundary = scratch_value(plane, base + select(params.width - 1u, 0u, shift >= 0.0));
     }
     var a = boundary;
     var b = boundary;
-    if (left >= 0 && left < i32(params.width)) {a = scratch[base + u32(left)];}
-    if (right >= 0 && right < i32(params.width)) {b = scratch[base + u32(right)];}
+    if (left >= 0 && left < i32(params.width)) {a = scratch_value(plane, base + u32(left));}
+    if (right >= 0 && right < i32(params.width)) {b = scratch_value(plane, base + u32(right));}
     return a * (1.0 - fraction) + b * fraction;
 }
 @compute @workgroup_size(16, 16, 1)

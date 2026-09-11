@@ -25,7 +25,9 @@ fn render(
     height: usize,
 ) {
     let mut view = YiqView::from_parts(data, (width, height), effect.use_field.to_yiq_field(7));
-    runner.apply_effect(&mut view, effect, 7, [1.0, 1.0]);
+    runner
+        .apply_effect(&mut view, effect, 7, [1.0, 1.0])
+        .unwrap();
 }
 
 fn criterion_benchmark(c: &mut Criterion) {

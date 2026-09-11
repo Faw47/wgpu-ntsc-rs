@@ -1,7 +1,9 @@
 @group(0) @binding(0) var<storage, read_write> y_plane: array<f32>;
 @group(0) @binding(1) var<storage, read_write> i_plane: array<f32>;
 @group(0) @binding(2) var<storage, read_write> q_plane: array<f32>;
-@group(0) @binding(3) var<storage, read_write> scratch_plane: array<f32>;
+@group(0) @binding(3) var<storage, read_write> scratch_y: array<f32>;
+@group(0) @binding(4) var<storage, read_write> scratch_i: array<f32>;
+@group(0) @binding(5) var<storage, read_write> scratch_q: array<f32>;
 
 struct ShaderParams {
     width: u32,
@@ -66,15 +68,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Left sample
     if (src_x_left >= 0 && src_x_left < i32(width)) {
         let left_idx = u32(dst_y) * width + u32(src_x_left);
-        i_val += scratch_plane[left_idx] * (1.0 - fract_x);
-        q_val += scratch_plane[left_idx + arrayLength(&i_plane)] * (1.0 - fract_x);
+        i_val += scratch_i[left_idx] * (1.0 - fract_x);
+        q_val += scratch_q[left_idx] * (1.0 - fract_x);
     }
 
     // Right sample
     if (src_x_right >= 0 && src_x_right < i32(width)) {
         let right_idx = u32(dst_y) * width + u32(src_x_right);
-        i_val += scratch_plane[right_idx] * fract_x;
-        q_val += scratch_plane[right_idx + arrayLength(&i_plane)] * fract_x;
+        i_val += scratch_i[right_idx] * fract_x;
+        q_val += scratch_q[right_idx] * fract_x;
     }
 
     i_plane[index] = i_val;

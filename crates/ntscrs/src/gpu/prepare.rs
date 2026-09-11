@@ -1,7 +1,9 @@
 //! Compact stochastic control data. The CPU generates the reference RNG sequence;
 //! shaders evaluate noise and transform image pixels. No image is processed here.
 use crate::{
-    noise::{Fbm, Simplex, Simplex1d, Simplex2d, sample_noise_1d, sample_noise_2d},
+    noise::{
+        Fbm, Simplex, Simplex1d, Simplex2d, active_f32_lane_count, sample_noise_1d, sample_noise_2d,
+    },
     noise_seeds,
     random::{SplitMix64, geometric_lambda},
     settings::standard::*,
@@ -23,6 +25,8 @@ pub struct Row {
     pub transient_len: f32,
     pub transient_intensity: f32,
     pub extend: u32,
+    /// SIMD lane count for noise rows; chroma-loss flag for loss rows. These stages
+    /// never share a row payload, so the slot is intentionally reused.
     pub loss: u32,
 }
 
@@ -39,6 +43,7 @@ fn noise_row(
     frequency: f32,
     intensity: f32,
     detail: i32,
+    lane_count: usize,
 ) -> Row {
     let mut rng = rng.clone().mix(index as u64);
     Row {
@@ -47,6 +52,7 @@ fn noise_row(
         frequency,
         intensity: intensity * 0.25,
         octaves: (detail.max(0) as u32).clamp(1, 5),
+        loss: lane_count as u32,
         ..Row::default()
     }
 }
@@ -61,6 +67,7 @@ pub fn noise(
     settings: &FbmNoiseSettings,
 ) -> Vec<Row> {
     let rng = stage_rng(seed, frame, tag);
+    let lane_count = active_f32_lane_count();
     let mut result = vec![Row::default(); rows];
     with_thread_pool(|| {
         ZipChunks::new([&mut result], 1).par_for_each(|row, [slot]| {
@@ -71,6 +78,7 @@ pub fn noise(
                 settings.frequency / scale,
                 settings.intensity,
                 settings.detail,
+                lane_count,
             );
         });
     });
@@ -120,7 +128,7 @@ pub fn head(
     for (index, row) in result[start..].iter_mut().enumerate() {
         let index = affected - (index + cutoff);
         let shift = settings.horiz_shift * ((index + offset) as f32 / count as f32).powf(1.5);
-        row.shift = (shift + rng.clone().mix(index as u64).random::<f32>() - 0.5) * sx;
+        row.shift = (shift + (rng.clone().mix(index as u64).random::<f32>() - 0.5)) * sx;
         row.start = 0;
         if index == affected
             && let Some(mid) = &settings.mid_line
@@ -213,6 +221,7 @@ pub fn tracking(
         };
         rows
     ];
+    let lane_count = active_f32_lane_count();
     let mut snow = Snow::new(width, rows);
     for (local, row) in result[start..].iter_mut().enumerate() {
         let index = local + cutoff;
@@ -224,6 +233,7 @@ pub fn tracking(
             0.25 / sx,
             intensity.powi(2) * settings.noise_intensity * 4.0,
             1,
+            lane_count,
         );
         row.shift = shifts[local] * intensity * settings.wave_intensity * 0.25 * sx;
         snow.row(
@@ -374,6 +384,7 @@ mod tests {
         settings: &FbmNoiseSettings,
     ) -> Vec<Row> {
         let rng = stage_rng(seed, frame, tag);
+        let lane_count = active_f32_lane_count();
         (0..rows)
             .map(|row| {
                 noise_row(
@@ -383,6 +394,7 @@ mod tests {
                     settings.frequency / scale,
                     settings.intensity,
                     settings.detail,
+                    lane_count,
                 )
             })
             .collect()
@@ -421,6 +433,38 @@ mod tests {
     }
 
     #[test]
+    fn head_shift_uses_pinned_upstream_expression_grouping() {
+        let settings = HeadSwitchingSettings {
+            height: 12,
+            offset: 2,
+            horiz_shift: 5.0,
+            mid_line: None,
+        };
+        let sx = 0.125;
+        let sy = 1.0;
+        let width = 65;
+        let rows = 33;
+        let actual = head(-47, 13, width, rows, sx, sy, &settings);
+
+        let count = (settings.height.max(0) as f32 * sy).round() as usize;
+        let offset = (settings.offset.max(0) as f32 * sy).round() as usize;
+        let affected = count - offset;
+        let start = rows.saturating_sub(affected);
+        let cutoff = affected.saturating_sub(rows);
+        let rng = stage_rng(-47, 13, noise_seeds::HEAD_SWITCHING);
+        for (local, row) in actual[start..].iter().enumerate() {
+            let index = affected - (local + cutoff);
+            let shift = settings.horiz_shift * ((index + offset) as f32 / count as f32).powf(1.5);
+            let expected = (shift + (rng.clone().mix(index as u64).random::<f32>() - 0.5)) * sx;
+            assert_eq!(
+                row.shift.to_bits(),
+                expected.to_bits(),
+                "head row {local} does not match pinned upstream grouping"
+            );
+        }
+    }
+
+    #[test]
     fn fixed_seed_stochastic_control_fingerprints() {
         let noise_settings = FbmNoiseSettings {
             frequency: 1.7,
@@ -433,11 +477,14 @@ mod tests {
             (noise_seeds::VIDEO_CHROMA_I, 11_125_566_137_780_981_240),
             (noise_seeds::VIDEO_CHROMA_Q, 15_709_688_246_788_731_364),
         ] {
-            assert_eq!(
-                row_fingerprint(&noise(-47, 13, tag, 65, 33, 1.25, &noise_settings)),
-                expected,
-                "noise tag {tag}"
+            let rows = noise(-47, 13, tag, 65, 33, 1.25, &noise_settings);
+            assert!(
+                rows.iter()
+                    .all(|row| row.loss as usize == active_f32_lane_count())
             );
+            let mut portable_rows = rows;
+            portable_rows.iter_mut().for_each(|row| row.loss = 0);
+            assert_eq!(row_fingerprint(&portable_rows), expected, "noise tag {tag}");
         }
 
         assert_eq!(
@@ -456,7 +503,7 @@ mod tests {
             )),
             7_299_772_395_079_915_787
         );
-        let (tracking_rows, tracking_snow) = tracking(
+        let (mut tracking_rows, tracking_snow) = tracking(
             -47,
             13,
             65,
@@ -465,6 +512,12 @@ mod tests {
             0.75,
             &TrackingNoiseSettings::default(),
         );
+        assert!(
+            tracking_rows
+                .iter()
+                .any(|row| row.loss as usize == active_f32_lane_count())
+        );
+        tracking_rows.iter_mut().for_each(|row| row.loss = 0);
         assert_eq!(row_fingerprint(&tracking_rows), 7_011_883_219_807_750_076);
         assert_eq!(word_fingerprint(&tracking_snow), 14_695_981_039_346_656_037);
         assert_eq!(

@@ -10,8 +10,17 @@ mod tests {
     fn max_plane_diff(a: &[f32], b: &[f32]) -> f32 {
         a.iter()
             .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
+            .map(|(x, y)| {
+                assert!(x.is_finite() && y.is_finite(), "non-finite plane value");
+                (x - y).abs()
+            })
             .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    #[should_panic(expected = "non-finite plane value")]
+    fn max_plane_diff_rejects_nan() {
+        max_plane_diff(&[f32::NAN], &[0.0]);
     }
 
     #[cfg(feature = "gpu-wgpu")]
@@ -40,7 +49,9 @@ mod tests {
         let effect = NtscEffect::default();
 
         let mut cpu_runner = NtscEffectRunner::new(BackendType::Cpu);
-        cpu_runner.apply_effect(&mut cpu_yiq_view, &effect, 0, [1.0, 1.0]);
+        cpu_runner
+            .apply_effect(&mut cpu_yiq_view, &effect, 0, [1.0, 1.0])
+            .unwrap();
 
         #[cfg(feature = "gpu-wgpu")]
         {
@@ -55,7 +66,12 @@ mod tests {
             let mut wgpu_runner = NtscEffectRunner::new(BackendType::Wgpu);
             assert_eq!(wgpu_runner.active_backend(), BackendType::Wgpu);
             {
-                wgpu_runner.apply_effect(&mut yiq_view, &effect, 0, [1.0, 1.0]);
+                let execution = wgpu_runner
+                    .apply_effect(&mut yiq_view, &effect, 0, [1.0, 1.0])
+                    .unwrap();
+                assert_eq!(execution.actual, BackendType::Wgpu);
+                assert_eq!(execution.cpu_image_effect_invocations, 0);
+                assert!(!execution.dispatched_stages.is_empty());
                 assert_eq!(wgpu_runner.last_backend(), BackendType::Wgpu);
                 assert!(wgpu_runner.fallback_reason().is_none());
 
@@ -118,7 +134,12 @@ mod tests {
         let mut wgpu_runner = NtscEffectRunner::new(BackendType::Wgpu);
         assert_eq!(wgpu_runner.active_backend(), BackendType::Wgpu);
         {
-            wgpu_runner.apply_effect(&mut runner_view, &effect, 0, [1.0, 1.0]);
+            let execution = wgpu_runner
+                .apply_effect(&mut runner_view, &effect, 0, [1.0, 1.0])
+                .unwrap();
+            assert_eq!(execution.actual, BackendType::Wgpu);
+            assert_eq!(execution.cpu_image_effect_invocations, 0);
+            assert!(!execution.dispatched_stages.is_empty());
             assert_eq!(wgpu_runner.last_backend(), BackendType::Wgpu);
             assert!(wgpu_runner.fallback_reason().is_none());
             assert_eq!(direct_view.y.len(), runner_view.y.len());
@@ -135,5 +156,31 @@ mod tests {
                 "interleaved Q mismatch"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires a compute adapter"]
+    fn destroyed_explicit_wgpu_device_returns_an_error_without_cpu_processing() {
+        let effect = NtscEffect::default();
+        let mut runner = NtscEffectRunner::new(BackendType::Wgpu);
+        assert_eq!(runner.active_backend(), BackendType::Wgpu);
+        runner.destroy_wgpu_device_for_test();
+
+        let dimensions = (8, 8);
+        let mut data = vec![0.2; YiqView::buf_length_for(dimensions, YiqField::Both)];
+        let original = data.clone();
+        let error = runner
+            .apply_effect(
+                &mut YiqView::from_parts(&mut data, dimensions, YiqField::Both),
+                &effect,
+                0,
+                [1.0, 1.0],
+            )
+            .unwrap_err();
+        assert_eq!(error.kind, crate::gpu::BackendFailureKind::DeviceLost);
+        assert_eq!(
+            data, original,
+            "explicit WGPU failure must not invoke the CPU effect"
+        );
     }
 }

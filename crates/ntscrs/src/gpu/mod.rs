@@ -13,11 +13,55 @@ mod tests;
 pub enum BackendType {
     /// Always use the CPU.
     Cpu,
-    /// Use WGPU for GPU acceleration. Falls back to CPU if WGPU initialization fails.
-    #[cfg(feature = "gpu-wgpu")]
+    /// Use WGPU for GPU acceleration.
     Wgpu,
+    /// Reserved for the unimplemented CUDA backend.
+    Cuda,
     /// Automatically select the best available backend (WGPU if supported, otherwise CPU).
     Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendFailureKind {
+    Unavailable,
+    Initialization,
+    UnsupportedCapacity,
+    Runtime,
+    Readback,
+    DeviceLost,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendError {
+    pub requested: BackendType,
+    pub kind: BackendFailureKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for BackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "requested {:?} backend failed ({:?}): {}",
+            self.requested, self.kind, self.message
+        )
+    }
+}
+
+impl std::error::Error for BackendError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendExecution {
+    pub requested: BackendType,
+    pub actual: BackendType,
+    pub fallback_reason: Option<BackendError>,
+    /// Number of calls into the CPU image-effect entry point during this execution.
+    pub cpu_image_effect_invocations: u64,
+    /// WGPU entry points encoded for this execution. This is regression instrumentation,
+    /// not cryptographic attestation.
+    pub dispatched_stages: Vec<&'static str>,
+    /// CPU-generated control signals uploaded for shader application.
+    pub cpu_control_stages: Vec<&'static str>,
 }
 
 impl Default for BackendType {

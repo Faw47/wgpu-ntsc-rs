@@ -52,9 +52,7 @@ pub fn apply_effect_to_yiq_with_backend_preference(
     frame_num: usize,
     scale_factor: [f32; 2],
     backend_preference: BackendPreference,
-) -> gpu::BackendType {
-    #[cfg(not(feature = "gpu-wgpu"))]
-    let _ = backend_preference;
+) -> Result<gpu::BackendExecution, gpu::BackendError> {
     // A GStreamer worker processes many frames. Keep its GPU device, compiled pipelines,
     // and frame buffers alive instead of initializing the entire backend for every frame.
     #[cfg(feature = "gpu-wgpu")]
@@ -86,11 +84,14 @@ pub fn apply_effect_to_yiq_with_backend_preference(
                 *cached = (backend_preference, make_runner(backend_preference));
             }
             let (_, runner) = &mut *cached;
-            runner.apply_effect(yiq, effect, frame_num, scale_factor);
-            runner.last_backend()
+            runner.apply_effect(yiq, effect, frame_num, scale_factor)
         });
     }
-    // CUDA has no implementation. Explicit CPU and builds without wgpu use the reference.
-    effect.apply_effect_to_yiq(yiq, frame_num, scale_factor);
-    gpu::BackendType::Cpu
+    let requested = match backend_preference {
+        BackendPreference::Auto => gpu::BackendType::Auto,
+        BackendPreference::Cpu => gpu::BackendType::Cpu,
+        BackendPreference::Wgpu => gpu::BackendType::Wgpu,
+        BackendPreference::Cuda => gpu::BackendType::Cuda,
+    };
+    gpu::runner::NtscEffectRunner::new(requested).apply_effect(yiq, effect, frame_num, scale_factor)
 }
