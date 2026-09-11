@@ -273,6 +273,14 @@ impl WgpuFrame {
         }
         if let Err(error) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
             self.staging_buffers.iter().for_each(wgpu::Buffer::unmap);
+            if let Some(message) = self
+                .device_lost
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return Err(WgpuBackendError::DeviceLost(message));
+            }
             return Err(WgpuBackendError::Runtime(error.to_string()));
         }
         let mut mapping_error = None;
@@ -288,18 +296,18 @@ impl WgpuFrame {
                 Err(error) => mapping_error = Some(error),
             }
         }
-        if let Some(error) = mapping_error {
-            self.staging_buffers.iter().for_each(wgpu::Buffer::unmap);
-            return Err(error);
-        }
         if let Some(error) = self
             .device_lost
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+            .clone()
         {
             self.staging_buffers.iter().for_each(wgpu::Buffer::unmap);
             return Err(WgpuBackendError::DeviceLost(error));
+        }
+        if let Some(error) = mapping_error {
+            self.staging_buffers.iter().for_each(wgpu::Buffer::unmap);
+            return Err(error);
         }
         let runtime_errors = {
             let mut errors = self
@@ -813,7 +821,10 @@ impl WgpuBackend {
             delay: delay as u32,
             filter_len: tf.len() as u32,
             plane_idx,
-            initial_condition_mode: u32::from(first_sample),
+            // Bit 0 selects FirstSample initial conditions. Bit 1 selects the
+            // fused arithmetic used by the active upstream SIMD backend.
+            initial_condition_mode: u32::from(first_sample)
+                | (u32::from(tf.gpu_uses_fused_mul_add()) << 1),
         };
 
         let key: [u32; 16] = bytemuck::cast(filter_coeffs);

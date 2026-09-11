@@ -169,18 +169,20 @@ mod tests {
         let dimensions = (8, 8);
         let mut data = vec![0.2; YiqView::buf_length_for(dimensions, YiqField::Both)];
         let original = data.clone();
-        let error = runner
-            .apply_effect(
-                &mut YiqView::from_parts(&mut data, dimensions, YiqField::Both),
-                &effect,
-                0,
-                [1.0, 1.0],
-            )
-            .unwrap_err();
-        assert_eq!(error.kind, crate::gpu::BackendFailureKind::DeviceLost);
+        for _ in 0..2 {
+            let error = runner
+                .apply_effect(
+                    &mut YiqView::from_parts(&mut data, dimensions, YiqField::Both),
+                    &effect,
+                    0,
+                    [1.0, 1.0],
+                )
+                .unwrap_err();
+            assert_eq!(error.kind, crate::gpu::BackendFailureKind::DeviceLost);
+        }
         assert_eq!(
             data, original,
-            "explicit WGPU failure must not invoke the CPU effect"
+            "repeated explicit WGPU failures must not invoke the CPU effect"
         );
     }
 }

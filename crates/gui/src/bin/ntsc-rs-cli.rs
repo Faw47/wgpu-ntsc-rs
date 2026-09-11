@@ -308,7 +308,7 @@ pub fn main() -> Result<()> {
         .arg(
             Arg::new("backend")
                 .long("backend")
-                .help("Preferred effect backend (phase 1 currently keeps CPU behavior).")
+                .help("Preferred effect backend (auto, CPU, WGPU, or CUDA when available).")
                 .value_parser(EnumValueParser::<BackendPreferenceArg>::new())
                 .default_value("auto"),
         )

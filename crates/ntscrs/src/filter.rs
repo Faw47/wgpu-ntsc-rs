@@ -100,6 +100,43 @@ impl TransferFunction {
         !level.is_fallback() && (2..=4).contains(&self.len.get())
     }
 
+    /// Whether the active upstream-equivalent SIMD implementation evaluates
+    /// `mul_add` with one IEEE-754 rounding step.
+    ///
+    /// The WGPU filter has to follow the host CPU selected by `fearless_simd`:
+    /// AVX2/AVX512 and NEON use fused instructions, while the scalar, SSE2,
+    /// SSE4.2, and non-relaxed wasm implementations multiply and add
+    /// separately. Filters of order zero use the scalar implementation even
+    /// on a host with fused SIMD support.
+    #[cfg(feature = "gpu-wgpu")]
+    pub(crate) fn gpu_uses_fused_mul_add(&self) -> bool {
+        if !self.should_use_simd(Level::new()) {
+            return false;
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            return Level::new().as_avx2().is_some();
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            return Level::new().as_neon().is_some();
+        }
+
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            target_feature = "relaxed-simd"
+        ))]
+        {
+            return Level::new().as_wasm_simd128().is_some();
+        }
+
+        #[allow(unreachable_code)]
+        false
+    }
+
     #[inline(always)]
     fn num_den(&self) -> (&[f32], &[f32]) {
         let len = self.len();
