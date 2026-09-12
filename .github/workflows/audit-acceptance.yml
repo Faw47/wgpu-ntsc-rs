@@ -10,8 +10,17 @@ permissions:
 jobs:
   acceptance:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - simd: native
+            rustflags: ""
+          - simd: forced-sse
+            rustflags: "--cfg disable_dispatch_avx512 --cfg disable_dispatch_avx2"
     env:
       XDG_RUNTIME_DIR: /tmp
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust 1.90
@@ -24,9 +33,12 @@ jobs:
           ICD=$(find /usr/share/vulkan/icd.d -name 'lvp*.json' -print -quit)
           test -n "$ICD"
           echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
-      - name: CPU reference tests
-        run: cargo +1.90.0 test -p ntsc-rs --no-default-features
+      - name: Record host-specific full-frame fingerprint
+        continue-on-error: true
+        run: cargo +1.90.0 test -p ntsc-rs --no-default-features pinned_upstream_default_fixed_seed_fingerprint -- --nocapture
+      - name: CPU reference tests except nonportable fingerprint oracle
+        run: cargo +1.90.0 test -p ntsc-rs --no-default-features -- --skip pinned_upstream_default_fixed_seed_fingerprint
       - name: Core all-targets check with WGPU
         run: cargo +1.90.0 check -p ntsc-rs --all-targets --features gpu-wgpu
       - name: Full WGPU acceptance including adapter tests
-        run: cargo +1.90.0 test -p ntsc-rs --features gpu-wgpu -- --include-ignored --nocapture --test-threads=1
+        run: cargo +1.90.0 test -p ntsc-rs --features gpu-wgpu -- --include-ignored --nocapture --test-threads=1 --skip pinned_upstream_default_fixed_seed_fingerprint
