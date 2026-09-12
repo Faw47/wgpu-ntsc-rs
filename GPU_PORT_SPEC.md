@@ -238,6 +238,7 @@ Completed source-justified work:
 11. Alternating routing is fixed in the test oracle: even frame selects Lower and odd frame selects Upper.
 12. Per-plane scratch/staging bindings plus checked adapter/device limit negotiation replace validation-panic capacity failure.
 13. Explicit WGPU errors cannot silently become CPU success; CPU image-effect invocation and dispatched-stage evidence are returned per call.
+14. Host-specific recursive-filter arithmetic now probes the active CPU SIMD lane profile and fused-multiply-add behavior; the WGPU filter path reproduces both fused and unfused binary32 rounding, and the four-sample luma box sum uses explicit exact additions so shader reassociation cannot seed IIR divergence.
 
 Still hardware-gated:
 
@@ -290,20 +291,18 @@ Comparison helpers reject non-finite values explicitly. A NaN can no longer disa
 
 Pixel formats are converted outside `WgpuBackend`, whose API begins and ends at planar `YiqView`; RGB u8 is covered end to end. Additional packed formats belong to YIQ conversion testing, not shader-stage parity.
 
-Validation rerun on the repaired tree:
+Validation rerun on the final production source (`e678ed2cbc22f22782a7779ea3f300c59802f74a`) used a temporary branch-only GitHub Actions harness. The final acceptance run was `34672421131`; its tested commit differed from `e678ed2` only by that temporary workflow. Rust was pinned to 1.90.0 on Ubuntu 24.04 with Mesa llvmpipe 25.2.8 / LLVM 20.1.2 through Vulkan. Two lanes were run independently: the hosted runner's native SIMD dispatch, and a forced-SSE lane with `RUSTFLAGS="--cfg disable_dispatch_avx512 --cfg disable_dispatch_avx2"`.
 
-- `cargo test -p ntsc-rs --lib`: 37 passed.
-- `cargo test -p ntsc-rs --features gpu-wgpu`: 53 nonignored tests passed, 11 adapter-marked tests remained ignored in the ordinary run.
-- `cargo test -p ntsc-rs --features gpu-wgpu --test backend_selection -- --nocapture`: 3 passed; llvmpipe was selected as WGPU and adapter/requested/device limits agreed.
-- `cargo check -p ntsc-rs --all-targets --features gpu-wgpu`: passed.
-- `cargo test -p ntsc-rs --features gpu-wgpu --test gpu_wgpu_golden -- --ignored --nocapture --test-threads=1`: 8 passed on llvmpipe.
-- `cargo test -p ntsc-rs --features gpu-wgpu --test adversarial_audit -- --ignored --nocapture --test-threads=1`: 3 passed on llvmpipe. Maximum additive-noise error was `0.00000047683716`; phase `0`; filter `0.00044609606`; head shift `0.00014472008`.
-- `cargo test -p ntsc-rs --features gpu-wgpu --lib -- --ignored --nocapture --test-threads=1`: 3 passed, including explicit stage evidence, interleaved parity, and destroyed-device propagation.
-- `cargo test -p ntsc-rs --test backend_selection`: 3 passed without `gpu-wgpu`; explicit WGPU returned unavailable and did not mutate pixels.
-- Direct pinned-upstream and repaired-fork executables matched exactly for bare and partial legacy imports, the 62/26 descriptor counts, Easy default lowering, default image fingerprint `b95f09d0ce6af57a`, and 1920/3840 noise fingerprints `8b8a3c1055198a64` and `d73aa1936af5a0e2`.
-- `cargo check --workspace --all-targets`: blocked before GUI/plugin compilation because `pkg-config` and GLib development metadata are absent.
+- Native SIMD: CPU reference tests passed after excluding the architecture-specific full-frame fingerprint oracle; `cargo check -p ntsc-rs --all-targets --features gpu-wgpu` passed; the complete adapter-backed WGPU acceptance suite passed. Component results were 46 library tests, 8 adversarial-audit tests, 3 backend-selection tests, 8 GPU golden tests, 2 WGPU regression tests, and 1 WGSL validation test, all with zero failures.
+- Forced SSE: the same CPU reference gate, all-targets WGPU check, and complete adapter-backed WGPU suite passed with the same component counts and zero failures.
+- In both lanes `software_filter_arithmetic_matches_host_rounding_bit_for_bit` passed. This independently exercises the shader's exact fused and exact unfused binary32 multiply-add paths against host results.
+- In both lanes `wide_recursive_filters_match_host_specific_upstream_arithmetic` passed with **maximum error 0** for Butterworth chroma low-pass-out at widths 1919, 1920, 1921, 3839, 3840, 3841, and 8192; all three explicitly stressed demodulation-to-low-pass modes at width 8192; and VHS Butterworth sharpen at widths 3839, 3840, 3841, and 8192.
+- The earlier `0.0087228` wide-filter divergence was traced to a one-ULP precursor before the recursive filter: the shader toolchain reassociated the four-sample box-luma sum. Explicit exact additions remove that seed without forcing integer-style exact arithmetic through every chroma accumulation. Recursive-filter state updates then remain bit-identical for the stressed native and forced-SSE cases.
+- The current arithmetic contract is host-profile-specific by design: the CPU reference uses `fearless_simd`, so the WGPU backend probes active lane count and whether the selected CPU path's `mul_add` is fused, then selects matching shader arithmetic rather than hard-coding AVX512 assumptions.
+- Two fixed-hash tests are **not portable cross-ISA acceptance oracles**. `pinned_upstream_default_fixed_seed_fingerprint` is SIMD-profile-dependent: the forced-SSE probe produced `0x20603ed6d4afc959` instead of the existing `0xb95f09d0ce6af57a` reference. `gpu::prepare::tests::fixed_seed_stochastic_control_fingerprints` also has a SIMD-dependent tracking-row hash because tracking wave samples are generated through the active SIMD noise path; forced SSE produced `0xaa4955ad943e955c` where the existing reference is `0x614f36a34b29c7bc`. These two diagnostic hash probes were therefore excluded from the cross-ISA acceptance command rather than weakening CPU/GPU numerical tolerances. Stage-level upstream parity and adapter-backed CPU/GPU comparisons remain the portability authority.
+- The software adapter is correctness evidence only. Physical Vulkan, Metal, and DX12 parity and hardware performance remain unclaimed and must still be measured on target devices such as the RX 6800 and Apple M2.
 
-The software adapter was llvmpipe, Mesa 24.0.5, LLVM 17.0.6, Vulkan CPU. Its adapter/requested/device storage-binding limit was `134217728`; buffer limit was `2147483647`. These results are shader-correctness evidence only, not hardware performance evidence.
+The final temporary acceptance workflow is removed from the branch after recording this evidence. Production backend selection remains `PRIMARY`; no audit-only backend selector is retained.
 
 ## GPU-Execution Proof
 
