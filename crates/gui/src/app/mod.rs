@@ -24,11 +24,14 @@ pub mod system_fonts;
 pub mod third_party_licenses_dialog;
 pub mod ui_context;
 pub mod update_dialog;
+pub mod workspace;
 
 pub type AppFn = Box<dyn FnOnce(&mut NtscApp) -> Result<(), error::ApplicationError> + Send>;
 pub type ApplessFn = Box<dyn FnOnce() -> Result<(), error::ApplicationError> + Send>;
 
 pub struct NtscApp {
+    pub workspace: workspace::WorkspaceState,
+    pub initial_media: Option<PathBuf>,
     pub gstreamer_init: GstreamerInitState,
     pub settings_list: SettingsList<NtscEffectFullSettings>,
     pub settings_list_easy: SettingsList<EasyModeFullSettings>,

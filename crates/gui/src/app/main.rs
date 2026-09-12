@@ -97,7 +97,9 @@ static ICON: &[u8] = include_bytes!("../../../../assets/icon.png");
 pub fn run() -> Result<(), Box<dyn Error>> {
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
 
-    let viewport = egui::ViewportBuilder::default().with_inner_size([1300.0, 720.0]);
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1360.0, 820.0])
+        .with_min_inner_size([840.0, 560.0]);
 
     // Use the bundle icon for macOS
     #[cfg(not(target_os = "macos"))]
@@ -107,7 +109,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let options = eframe::NativeOptions {
         viewport: viewport
-            .with_inner_size([1300.0, 720.0])
+            .with_inner_size([1360.0, 820.0])
             .with_app_id(NtscApp::APP_ID),
         ..Default::default()
     };
@@ -170,8 +172,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 let scale_settings =
                     eframe::get_value::<VideoScaleState>(storage, "scale_settings")
                         .unwrap_or_default();
-                let recent_files = eframe::get_value::<Vec<PathBuf>>(storage, "recent_files")
-                    .unwrap_or_default();
+                let recent_files =
+                    eframe::get_value::<Vec<PathBuf>>(storage, "recent_files").unwrap_or_default();
 
                 (
                     settings,
@@ -195,6 +197,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             easy_mode_enabled &= EXPERIMENTAL_EASY_MODE;
 
             ctx.style_mut(|style| style.interaction.tooltip_delay = 0.5);
+            super::workspace::configure_style(&ctx);
             Ok(Box::new(NtscApp::new(
                 ctx,
                 settings_list,
@@ -227,6 +230,8 @@ impl NtscApp {
         gstreamer_init: GstreamerInitState,
     ) -> Self {
         Self {
+            workspace: Default::default(),
+            initial_media: std::env::args_os().nth(1).map(PathBuf::from),
             gstreamer_init,
             settings_list,
             settings_list_easy,
@@ -692,7 +697,7 @@ impl NtscApp {
                     let _ = (descriptor.id.set)(effect_settings, default_val);
                     changed = true;
                 }
-                
+
                 resp
             }
             SettingDescriptor {
@@ -1079,6 +1084,30 @@ impl NtscApp {
             }
 
             ui.visuals_mut().clip_rect_margin = 4.0;
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Effects").strong());
+                let width = (ui.available_width() - 56.0).max(120.0);
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.workspace.search)
+                        .id_salt("effect_search")
+                        .hint_text("Search effects")
+                        .desired_width(width),
+                );
+                if self.workspace.focus_search {
+                    search.request_focus();
+                    self.workspace.focus_search = false;
+                }
+                if ui.button("Clear").clicked() {
+                    self.workspace.search.clear();
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                for section in super::workspace::EffectSection::VALUES {
+                    ui.selectable_value(&mut self.workspace.section, section, section.label());
+                }
+            });
+            let effect_search = self.workspace.search.clone();
+            let effect_section = self.workspace.section;
             egui::ScrollArea::vertical()
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
@@ -1158,17 +1187,32 @@ impl NtscApp {
                     }
 
                     if self.easy_mode_enabled {
+                        let descriptors = super::workspace::filter_descriptors(
+                            &settings_list_easy.setting_descriptors,
+                            effect_section,
+                            &effect_search,
+                        );
                         settings_changed |= Self::settings_from_descriptors(
                             easy_mode_settings,
                             ui,
-                            &settings_list_easy.setting_descriptors,
+                            &descriptors,
                             interlace_mode,
                         );
                     } else {
+                        let descriptors = super::workspace::filter_descriptors(
+                            &settings_list.setting_descriptors,
+                            effect_section,
+                            &effect_search,
+                        );
+                        if descriptors.is_empty() {
+                            ui.add_space(16.0);
+                            ui.label("No matching effects");
+                            ui.weak("Try another term or choose All.");
+                        }
                         settings_changed |= Self::settings_from_descriptors(
                             effect_settings,
                             ui,
-                            &settings_list.setting_descriptors,
+                            &descriptors,
                             interlace_mode,
                         );
                     }
@@ -2104,7 +2148,290 @@ impl NtscApp {
             });
     }
 
+    fn show_workspace(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if self.credits_dialog_open {
+            self.show_credits_dialog(ctx);
+        }
+        if self.third_party_licenses_dialog_open {
+            self.show_third_party_licenses_dialog(ctx);
+        }
+        if self.license_dialog_open {
+            self.show_license_dialog(ctx);
+        }
+        self.update_dialog.show(ctx);
+
+        if self.image_sequence_dialog_queued_render_job.is_some() {
+            let modal = egui::Modal::new(egui::Id::new("directory_not_empty")).show(ctx, |ui| {
+                ui.set_max_width(ctx.input(|i| i.content_rect().width() - 24.0).min(400.0));
+                ui.set_min_width(200.0);
+                ui.heading("Output directory is not empty");
+                ui.label(
+                    "You're rendering an image sequence into a directory that isn't empty. This \
+                     will output many individual image files into that directory.",
+                );
+                ui.separator();
+
+                egui::Sides::new().show(
+                    ui,
+                    |_| {},
+                    |ui| {
+                        if ui.button("OK").clicked() {
+                            let job = self
+                                .image_sequence_dialog_queued_render_job
+                                .take()
+                                .expect("image sequence confirmation callback")(
+                                self
+                            );
+                            match job {
+                                Ok(job) => self.render_jobs.push(job),
+                                Err(error) => self.handle_error(&error),
+                            }
+                        } else if ui.button("Cancel").clicked() {
+                            self.image_sequence_dialog_queued_render_job = None;
+                        }
+                    },
+                );
+            });
+
+            if modal.should_close() {
+                self.image_sequence_dialog_queued_render_job = None;
+            }
+        }
+
+        egui::TopBottomPanel::top("workspace_command_bar")
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .inner_margin(egui::Margin::symmetric(16, 9)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    super::workspace::brand(ui);
+                    ui.separator();
+                    ui.menu_button("File", |ui| {
+                        if ui.button("Open media...").clicked() {
+                            let dialog = rfd::AsyncFileDialog::new().set_parent(frame).pick_file();
+                            let ctx = ctx.clone();
+                            self.spawn(async move {
+                                dialog.await.map(|handle| {
+                                    Box::new(move |app: &mut NtscApp| {
+                                        app.load_video(&ctx, handle.into())
+                                    }) as _
+                                })
+                            });
+                            ui.close();
+                        }
+                        if !self.recent_files.is_empty() {
+                            ui.menu_button("Open recent", |ui| {
+                                let recent_files = self.recent_files.clone();
+                                for path in recent_files {
+                                    let label = path
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                                    if ui
+                                        .button(label)
+                                        .on_hover_text(path.to_string_lossy())
+                                        .clicked()
+                                    {
+                                        let ctx = ctx.clone();
+                                        self.spawn(async move {
+                                            Some(Box::new(move |app: &mut NtscApp| {
+                                                app.load_video(&ctx, path)
+                                            })
+                                                as _)
+                                        });
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                        if ui.button("Quit").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("Edit", |ui| {
+                        if ui
+                            .add_enabled(
+                                self.undoer.has_undo(&self.effect_settings),
+                                egui::Button::new("Undo"),
+                            )
+                            .clicked()
+                        {
+                            self.undo();
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.undoer.has_redo(&self.effect_settings),
+                                egui::Button::new("Redo"),
+                            )
+                            .clicked()
+                        {
+                            self.redo();
+                            ui.close();
+                        }
+                    });
+                    ui.menu_button("View", |ui| {
+                        if ui
+                            .button(if self.workspace.focus_preview {
+                                "Show inspector"
+                            } else {
+                                "Focus preview"
+                            })
+                            .clicked()
+                        {
+                            self.workspace.focus_preview = !self.workspace.focus_preview;
+                            ui.close();
+                        }
+                        ui.menu_button("Theme", |ui| {
+                            let mut preference =
+                                ui.ctx().options(|options| options.theme_preference);
+                            for (theme, label) in [
+                                (egui::ThemePreference::System, "System"),
+                                (egui::ThemePreference::Light, "Light"),
+                                (egui::ThemePreference::Dark, "Dark"),
+                            ] {
+                                if ui.selectable_value(&mut preference, theme, label).changed() {
+                                    ui.ctx().set_theme(preference);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
+                    ui.menu_button("Help", |ui| {
+                        if ui.button("Online documentation").clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(
+                                "https://ntsc.rs/docs/standalone-application/",
+                            ));
+                            ui.close();
+                        }
+                        if ui.button("License").clicked() {
+                            self.license_dialog_open = true;
+                            ui.close();
+                        }
+                        if ui.button("Third-party licenses").clicked() {
+                            self.third_party_licenses_dialog_open = true;
+                            ui.close();
+                        }
+                        if ui.button("About + credits").clicked() {
+                            self.credits_dialog_open = true;
+                            ui.close();
+                        }
+                        if ui.button("Check for updates...").clicked() {
+                            self.update_dialog.open();
+                            ui.close();
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .selectable_label(self.workspace.focus_preview, "Focus")
+                            .on_hover_text("Hide the inspector (F)")
+                            .clicked()
+                        {
+                            self.workspace.focus_preview = !self.workspace.focus_preview;
+                        }
+                        if ui
+                            .add_enabled(self.pipeline.is_some(), egui::Button::new("Export"))
+                            .clicked()
+                        {
+                            self.left_panel_state = LeftPanelState::RenderSettings;
+                            self.workspace.focus_preview = false;
+                        }
+                        if let Some(info) = &self.pipeline {
+                            ui.add(
+                                egui::Label::new(
+                                    info.path.file_name().unwrap_or_default().to_string_lossy(),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(info.path.to_string_lossy());
+                        } else {
+                            ui.weak("No media loaded");
+                        }
+                    });
+                });
+            });
+
+        if !self.workspace.focus_preview {
+            egui::SidePanel::right("workspace_inspector")
+                .frame(egui::Frame::side_top_panel(&ctx.style()).inner_margin(12))
+                .resizable(true)
+                .default_width(380.0)
+                .width_range(330.0..=560.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.left_panel_state,
+                            LeftPanelState::EffectSettings,
+                            "Effects",
+                        );
+                        ui.selectable_value(
+                            &mut self.left_panel_state,
+                            LeftPanelState::Presets,
+                            "Presets",
+                        );
+                        ui.selectable_value(
+                            &mut self.left_panel_state,
+                            LeftPanelState::RenderSettings,
+                            "Export",
+                        );
+                    });
+                    ui.separator();
+                    match self.left_panel_state {
+                        LeftPanelState::EffectSettings => {
+                            ui.heading("Build the signal");
+                            ui.weak("Double-click a value to reset it.");
+                            self.show_effect_settings(ui, frame);
+                        }
+                        LeftPanelState::Presets => {
+                            ui.heading("Your presets");
+                            ui.weak("Save, load, or install a look.");
+                            self.show_preset_settings(ui, frame);
+                        }
+                        LeftPanelState::RenderSettings => {
+                            ui.heading("Export media");
+                            ui.weak("Choose a codec, destination, and queue.");
+                            self.show_render_settings(ui, frame);
+                        }
+                    }
+                });
+        }
+
+        egui::TopBottomPanel::bottom("workspace_status")
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(16, 6)))
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(if self.pipeline.is_some() {
+                        "Space play/pause   •   F focus preview   •   Cmd/Ctrl+K find an effect"
+                    } else {
+                        "Open a video or image to start. Drop media anywhere in the preview."
+                    });
+                    if let Some(error) = self.last_error.borrow().as_ref() {
+                        ui.separator();
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                        if ui.button("Dismiss").clicked() {
+                            *self.last_error.borrow_mut() = None;
+                        }
+                    }
+                    if !self.render_jobs.is_empty() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(format!("{} export job(s)", self.render_jobs.len()));
+                        });
+                    }
+                });
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| self.show_video_pane(ui, frame));
+    }
+
     pub(crate) fn show_app(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.show_workspace(ctx, frame);
+        return;
+
+        #[allow(unreachable_code)]
         if self.credits_dialog_open {
             self.show_credits_dialog(ctx);
         }
@@ -2275,6 +2602,10 @@ impl NtscApp {
                             self.license_dialog_open = true;
                             ui.close();
                         }
+                        if ui.button("Third-party licenses").clicked() {
+                            self.third_party_licenses_dialog_open = true;
+                            ui.close();
+                        }
 
                         if ui.button("Third-Party Licenses").clicked() {
                             self.third_party_licenses_dialog_open = true;
@@ -2399,6 +2730,12 @@ impl NtscApp {
                         && input.key_pressed(egui::Key::Z)),
             )
         });
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::F) && input.modifiers.is_none()) {
+            self.workspace.focus_preview = !self.workspace.focus_preview;
+        }
         if should_undo {
             self.undo();
         } else if should_redo {
@@ -2449,6 +2786,16 @@ impl eframe::App for NtscApp {
         }
 
         self.handle_keyboard_shortcuts(ctx);
+
+        if let Some(path) = self.initial_media.take() {
+            let result = self.load_video(ctx, path);
+            self.handle_result(result);
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+            self.workspace.focus_preview = false;
+            self.left_panel_state = LeftPanelState::EffectSettings;
+            self.workspace.focus_search = true;
+        }
 
         self.show_app(ctx, frame);
 
