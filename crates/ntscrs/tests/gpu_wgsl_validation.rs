@@ -38,10 +38,20 @@ fn every_live_wgsl_module_parses_and_validates_without_an_adapter() {
             "luma box",
             include_str!("../src/gpu/shaders/luma_box.wgsl").to_owned(),
         ),
-        (
-            "luma into chroma",
-            include_str!("../src/gpu/shaders/luma_into_chroma.wgsl").to_owned(),
-        ),
+        ("luma into chroma", {
+            let filter = include_str!("../src/gpu/shaders/filter_plane.wgsl");
+            let start = filter
+                .find("// A four-word unsigned integer")
+                .expect("filter arithmetic start marker");
+            let end = filter
+                .find("@compute")
+                .expect("filter arithmetic end marker");
+            format!(
+                "{}\n{}",
+                &filter[start..end],
+                include_str!("../src/gpu/shaders/luma_into_chroma.wgsl")
+            )
+        }),
         (
             "row effects",
             format!(

@@ -219,6 +219,17 @@ pub struct PendingReadback {
     receivers: [std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>; 3],
 }
 
+fn filter_arithmetic_source() -> &'static str {
+    let source = include_str!("shaders/filter_plane.wgsl");
+    let start = source
+        .find("// A four-word unsigned integer")
+        .expect("filter arithmetic start marker");
+    let end = source
+        .find("@compute")
+        .expect("filter arithmetic end marker");
+    &source[start..end]
+}
+
 impl GpuFrame for WgpuFrame {
     fn download(&self, dst: &mut YiqView) {
         self.finish_download(dst, self.enqueue_download());
@@ -364,6 +375,8 @@ pub struct WgpuBackend {
     pub adapter_info: wgpu::AdapterInfo,
     pub adapter_limits: wgpu::Limits,
     pub requested_limits: wgpu::Limits,
+    simd_lane_count: u32,
+    simd_mul_add_fused: bool,
     runtime_errors: Arc<std::sync::Mutex<Vec<String>>>,
     pub(crate) device_lost: Arc<std::sync::Mutex<Option<String>>>,
     dispatch_stages: std::cell::RefCell<Vec<&'static str>>,
@@ -444,6 +457,8 @@ impl WgpuBackend {
                 Some(format!("{reason:?}: {message}"));
         });
 
+        let (simd_lane_count, simd_mul_add_fused) = crate::filter::active_gpu_simd_profile();
+
         let chroma_into_luma_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chroma_into_luma shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/chroma_into_luma.wgsl").into()),
@@ -451,7 +466,14 @@ impl WgpuBackend {
 
         let luma_into_chroma_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("luma_into_chroma shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/luma_into_chroma.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}",
+                    filter_arithmetic_source(),
+                    include_str!("shaders/luma_into_chroma.wgsl")
+                )
+                .into(),
+            ),
         });
 
         let chroma_delay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -743,6 +765,8 @@ impl WgpuBackend {
             adapter_info: adapter.get_info(),
             adapter_limits,
             requested_limits,
+            simd_lane_count,
+            simd_mul_add_fused,
             runtime_errors,
             device_lost,
             dispatch_stages: Default::default(),
@@ -824,7 +848,11 @@ impl WgpuBackend {
             // Bit 0 selects FirstSample initial conditions. Bit 1 selects the
             // fused arithmetic used by the active upstream SIMD backend.
             initial_condition_mode: u32::from(first_sample)
-                | (u32::from(tf.gpu_uses_fused_mul_add()) << 1),
+                | (u32::from(
+                    self.simd_mul_add_fused
+                        && self.simd_lane_count != 0
+                        && (2..=4).contains(&tf.len()),
+                ) << 1),
         };
 
         let key: [u32; 16] = bytemuck::cast(filter_coeffs);

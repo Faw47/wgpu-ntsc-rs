@@ -21,7 +21,7 @@ fn finite_bits(mut bits: u32) -> u32 {
 
 #[test]
 #[ignore = "requires a compute adapter"]
-fn software_fma_matches_host_f32_mul_add_bit_for_bit() {
+fn software_filter_arithmetic_matches_host_rounding_bit_for_bit() {
     let backend = WgpuBackend::new().expect("adapter required");
     eprintln!("ADAPTER {:?}", backend.adapter_info);
 
@@ -43,17 +43,19 @@ struct FmaInput {{
 }}
 
 @group(0) @binding(0) var<storage, read> inputs: array<FmaInput>;
-@group(0) @binding(1) var<storage, read_write> outputs: array<u32>;
+@group(0) @binding(1) var<storage, read_write> outputs: array<vec2<u32>>;
 
 @compute @workgroup_size(64, 1, 1)
 fn fma_test(@builtin(global_invocation_id) id: vec3<u32>) {{
     if (id.x >= arrayLength(&inputs)) {{ return; }}
     let input = inputs[id.x];
-    outputs[id.x] = bitcast<u32>(exact_fma_f32(
-        bitcast<f32>(input.a),
-        bitcast<f32>(input.b),
-        bitcast<f32>(input.c),
-    ));
+    let a = bitcast<f32>(input.a);
+    let b = bitcast<f32>(input.b);
+    let c = bitcast<f32>(input.c);
+    outputs[id.x] = vec2<u32>(
+        bitcast<u32>(upstream_mul_add(a, b, c, true)),
+        bitcast<u32>(upstream_mul_add(a, b, c, false)),
+    );
 }}
 "#,
         &filter_source[helper_start..helper_end]
@@ -83,12 +85,14 @@ fn fma_test(@builtin(global_invocation_id) id: vec3<u32>) {{
         cases.push(words);
     }
 
-    let expected: Vec<u32> = cases
+    let expected: Vec<[u32; 2]> = cases
         .iter()
         .map(|case| {
-            f32::from_bits(case[0])
-                .mul_add(f32::from_bits(case[1]), f32::from_bits(case[2]))
-                .to_bits()
+            let a = f32::from_bits(case[0]);
+            let b = f32::from_bits(case[1]);
+            let c = f32::from_bits(case[2]);
+            let rounded_product = std::hint::black_box(a * b);
+            [a.mul_add(b, c).to_bits(), (rounded_product + c).to_bits()]
         })
         .collect();
     let input = backend
@@ -98,7 +102,7 @@ fn fma_test(@builtin(global_invocation_id) id: vec3<u32>) {{
             contents: bytemuck::cast_slice(&cases),
             usage: wgpu::BufferUsages::STORAGE,
         });
-    let output_size = (expected.len() * size_of::<u32>()) as u64;
+    let output_size = (expected.len() * size_of::<[u32; 2]>()) as u64;
     let output = backend.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("exact FMA test outputs"),
         size: output_size,
@@ -171,7 +175,7 @@ fn fma_test(@builtin(global_invocation_id) id: vec3<u32>) {{
         .unwrap();
     receiver.recv().unwrap().unwrap();
     let mapped = slice.get_mapped_range();
-    let actual: &[u32] = bytemuck::cast_slice(&mapped);
+    let actual: &[[u32; 2]] = bytemuck::cast_slice(&mapped);
     for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
         assert_eq!(
             actual, expected,

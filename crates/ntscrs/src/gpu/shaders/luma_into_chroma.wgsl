@@ -54,7 +54,10 @@ fn get_box_y(index: u32) -> f32 {
     if (index % width + 2u < width) { p3 = scratch_plane[index + 2u]; }
     else if (index % width < width - 1u) { p3 = scratch_plane[index + 1u]; }
 
-    return (p0 + cur + p2 + p3) * 0.25;
+    var sum = exact_add_f32(p0, cur);
+    sum = exact_add_f32(sum, p2);
+    sum = exact_add_f32(sum, p3);
+    return sum * 0.25;
 }
 
 fn get_notch_y(index: u32) -> f32 {
@@ -64,7 +67,7 @@ fn get_notch_y(index: u32) -> f32 {
 fn get_one_line_comb_y(index: u32, width: u32) -> f32 {
     let line_num = index / width;
     let top_idx = select(index - width, index + width, line_num == 0u);
-    return (scratch_plane[top_idx] + scratch_plane[index]) * 0.5;
+    return exact_add_f32(scratch_plane[top_idx], scratch_plane[index]) * 0.5;
 }
 
 fn get_two_line_comb_y(index: u32, width: u32, height: u32) -> f32 {
@@ -74,7 +77,9 @@ fn get_two_line_comb_y(index: u32, width: u32, height: u32) -> f32 {
     let cur = scratch_plane[index];
     let prev = scratch_plane[u32(prev_idx)];
     let next = scratch_plane[u32(next_idx)];
-    return (cur * 0.5) + (prev * 0.25) + (next * 0.25);
+    let cur_term = cur * 0.5;
+    let prev_sum = exact_add_f32(cur_term, prev * 0.25);
+    return exact_add_f32(prev_sum, next * 0.25);
 }
 
 fn process_chroma(val: f32, shift: u32, index: u32, xi: u32) -> vec2<f32> {

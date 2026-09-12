@@ -54,6 +54,34 @@ fn filter_signal_simd<const ROWS: usize>(
     true
 }
 
+/// Lane count and multiply-add behavior of the SIMD backend used by upstream
+/// processing on this host. A zero lane count means scalar fallback.
+#[cfg(feature = "gpu-wgpu")]
+pub(crate) fn active_gpu_simd_profile() -> (u32, bool) {
+    let level = Level::new();
+    if level.is_fallback() {
+        return (0, false);
+    }
+
+    // This triple rounds to zero when multiplication and addition are
+    // separate, and to 0x337f_fffe when evaluated as one fused operation.
+    // Probe the backend because relaxed wasm SIMD may legally choose either.
+    let result_bits = dispatch!(level, simd => {
+        let a = f32x4::splat(simd, f32::from_bits(0x3f80_0001));
+        let b = f32x4::splat(simd, f32::from_bits(0x3f7f_ffff));
+        let c = f32x4::splat(simd, -1.0);
+        a.mul_add(b, c)[0].to_bits()
+    });
+    debug_assert!(
+        matches!(result_bits, 0 | 0x337f_fffe),
+        "unexpected SIMD mul_add probe result {result_bits:#010x}"
+    );
+    (
+        crate::noise::active_f32_lane_count() as u32,
+        result_bits == 0x337f_fffe,
+    )
+}
+
 impl TransferFunction {
     #[inline(always)]
     pub fn new(num: &[f32], den: &[f32]) -> Self {
@@ -98,43 +126,6 @@ impl TransferFunction {
     /// Whether we should use SIMD and hence process rows in chunks.
     pub fn should_use_simd(&self, level: Level) -> bool {
         !level.is_fallback() && (2..=4).contains(&self.len.get())
-    }
-
-    /// Whether the active upstream-equivalent SIMD implementation evaluates
-    /// `mul_add` with one IEEE-754 rounding step.
-    ///
-    /// The WGPU filter has to follow the host CPU selected by `fearless_simd`:
-    /// AVX2/AVX512 and NEON use fused instructions, while the scalar, SSE2,
-    /// SSE4.2, and non-relaxed wasm implementations multiply and add
-    /// separately. Filters of order zero use the scalar implementation even
-    /// on a host with fused SIMD support.
-    #[cfg(feature = "gpu-wgpu")]
-    pub(crate) fn gpu_uses_fused_mul_add(&self) -> bool {
-        if !self.should_use_simd(Level::new()) {
-            return false;
-        }
-
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            return Level::new().as_avx2().is_some();
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            return Level::new().as_neon().is_some();
-        }
-
-        #[cfg(all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            target_feature = "relaxed-simd"
-        ))]
-        {
-            return Level::new().as_wasm_simd128().is_some();
-        }
-
-        #[allow(unreachable_code)]
-        false
     }
 
     #[inline(always)]

@@ -315,6 +315,28 @@ mod numerical {
             }
         }
 
+        for demodulation in [
+            ChromaDemodulationFilter::Notch,
+            ChromaDemodulationFilter::OneLineComb,
+            ChromaDemodulationFilter::TwoLineComb,
+        ] {
+            let mut effect = clean();
+            effect.filter_type = FilterType::Butterworth;
+            effect.chroma_demodulation = demodulation;
+            effect.chroma_lowpass_out = ChromaLowpass::Full;
+            let error = diff(
+                &mut gpu,
+                &effect,
+                8192,
+                3,
+                [0.125, 1.0],
+                "wide-demodulation-into-lowpass-out",
+            );
+            if error > 0.002 {
+                failures.push(format!("demodulation/{demodulation:?}/8192: {error}"));
+            }
+        }
+
         for width in [3839, 3840, 3841, 8192] {
             let mut effect = clean();
             effect.filter_type = FilterType::Butterworth;

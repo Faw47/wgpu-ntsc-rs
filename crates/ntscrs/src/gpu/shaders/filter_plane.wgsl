@@ -228,6 +228,53 @@ fn round_finite_f32(
     return bitcast<f32>(sign | exponent_bits | (rounded & 0x7fffffu));
 }
 
+fn exact_add_f32(a: f32, b: f32) -> f32 {
+    let a_bits = bitcast<u32>(a);
+    let b_bits = bitcast<u32>(b);
+    let a_exp = (a_bits >> 23u) & 0xffu;
+    let b_exp = (b_bits >> 23u) & 0xffu;
+    if (a_exp == 0xffu || b_exp == 0xffu) {
+        return a + b;
+    }
+    if ((a_bits & 0x7fffffffu) == 0u || (b_bits & 0x7fffffffu) == 0u) {
+        return a + b;
+    }
+
+    let a_normal = normalize_f32(a_bits);
+    let b_normal = normalize_f32(b_bits);
+    let exponent_difference = abs(a_normal.exponent - b_normal.exponent);
+    if (exponent_difference > 64) {
+        return select(b, a, a_normal.exponent > b_normal.exponent);
+    }
+
+    let common_exponent = min(a_normal.exponent, b_normal.exponent);
+    let a_magnitude = u128_shift_left(
+        vec4<u32>(a_normal.mantissa, 0u, 0u, 0u),
+        u32(a_normal.exponent - common_exponent),
+    );
+    let b_magnitude = u128_shift_left(
+        vec4<u32>(b_normal.mantissa, 0u, 0u, 0u),
+        u32(b_normal.exponent - common_exponent),
+    );
+    let a_sign = a_bits & 0x80000000u;
+    let b_sign = b_bits & 0x80000000u;
+    var result_sign = a_sign;
+    var result_magnitude: vec4<u32>;
+    if (a_sign == b_sign) {
+        result_magnitude = u128_add(a_magnitude, b_magnitude);
+    } else {
+        let ordering = u128_compare(a_magnitude, b_magnitude);
+        if (ordering == 0) { return 0.0; }
+        if (ordering > 0) {
+            result_magnitude = u128_subtract(a_magnitude, b_magnitude);
+        } else {
+            result_sign = b_sign;
+            result_magnitude = u128_subtract(b_magnitude, a_magnitude);
+        }
+    }
+    return round_finite_f32(result_sign, result_magnitude, common_exponent, 0);
+}
+
 fn exact_fma_f32(a: f32, b: f32, c: f32) -> f32 {
     let a_bits = bitcast<u32>(a);
     let b_bits = bitcast<u32>(b);
@@ -311,7 +358,10 @@ fn exact_fma_f32(a: f32, b: f32, c: f32) -> f32 {
 
 fn upstream_mul_add(a: f32, b: f32, c: f32, fused: bool) -> f32 {
     if (fused) { return exact_fma_f32(a, b, c); }
-    return a * b + c;
+    // A source-level `a * b + c` is not a portable no-contraction barrier in
+    // GPU toolchains. Round the product first, then round the addition.
+    let rounded_product = exact_fma_f32(a, b, 0.0);
+    return exact_add_f32(rounded_product, c);
 }
 
 @compute @workgroup_size(64, 1, 1)
