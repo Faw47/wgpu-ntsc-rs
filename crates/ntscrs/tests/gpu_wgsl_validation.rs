@@ -15,6 +15,10 @@ fn validate(label: &str, source: &str) {
 fn every_live_wgsl_module_parses_and_validates_without_an_adapter() {
     for (label, source) in [
         (
+            "block filter experiment",
+            include_str!("../src/gpu/shaders/block_filter.wgsl").to_owned(),
+        ),
+        (
             "chroma delay",
             include_str!("../src/gpu/shaders/chroma_delay.wgsl").to_owned(),
         ),

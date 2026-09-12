@@ -383,6 +383,7 @@ pub struct WgpuBackend {
     cpu_control_stages: std::cell::RefCell<Vec<&'static str>>,
     pending_error: std::cell::RefCell<Option<WgpuBackendError>>,
     submitted_effects: u64,
+    profiler: Option<super::profiling::GpuProfiler>,
 }
 
 impl WgpuBackend {
@@ -433,7 +434,7 @@ impl WgpuBackend {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ntsc-rs wgpu device"),
-                required_features: wgpu::Features::empty(),
+                required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 required_limits: requested_limits.clone(),
                 ..Default::default()
             })
@@ -773,7 +774,40 @@ impl WgpuBackend {
             cpu_control_stages: Default::default(),
             pending_error: Default::default(),
             submitted_effects: 0,
+            profiler: None,
         })
+    }
+
+    /// Enable timestamps explicitly; unsupported devices remain usable without profiling.
+    /// Read after each apply_effect and before submitting the next frame.
+    pub fn set_profiling(&mut self, enabled: bool) -> bool {
+        self.profiler = if enabled
+            && self
+                .device
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY)
+        {
+            Some(super::profiling::GpuProfiler::new(&self.device))
+        } else {
+            None
+        };
+        self.profiler.is_some()
+    }
+
+    pub fn read_pass_timings(
+        &self,
+    ) -> Result<Option<Vec<super::profiling::PassTiming>>, WgpuBackendError> {
+        self.profiler
+            .as_ref()
+            .map(|p| p.read(&self.device, self.queue.get_timestamp_period()))
+            .transpose()
+    }
+
+    fn pass_descriptor(&self, stage: &'static str) -> wgpu::ComputePassDescriptor<'_> {
+        wgpu::ComputePassDescriptor {
+            label: Some(stage),
+            timestamp_writes: self.profiler.as_ref().and_then(|p| p.writes(stage)),
+        }
     }
 
     /// Number of effect command buffers submitted by this backend instance.
@@ -879,10 +913,7 @@ impl WgpuBackend {
             })
         });
 
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("filter_plane pass"),
-            timestamp_writes: None,
-        });
+        let mut cpass = encoder.begin_compute_pass(&self.pass_descriptor("filter_plane"));
         cpass.set_pipeline(&self.filter_plane_pipeline);
         cpass.set_bind_group(0, &frame.main_bind_group, &[]);
         cpass.set_bind_group(1, params_bind_group, &[]);
@@ -957,10 +988,7 @@ impl WgpuBackend {
         self.queue.write_buffer(buffer, 0, data);
         for &entry in entries {
             self.record_dispatch(entry);
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(entry),
-                timestamp_writes: None,
-            });
+            let mut pass = encoder.begin_compute_pass(&self.pass_descriptor(entry));
             pass.set_pipeline(&self.row_pipelines[entry]);
             pass.set_bind_group(0, main, &[]);
             pass.set_bind_group(1, params, &[]);
@@ -1127,6 +1155,9 @@ impl GpuBackend for WgpuBackend {
         frame_num: usize,
         scale_factor: [f32; 2],
     ) {
+        if let Some(profiler) = &self.profiler {
+            profiler.reset();
+        }
         self.data_index.set(0);
         self.dispatch_stages.borrow_mut().clear();
         self.cpu_control_stages.borrow_mut().clear();
@@ -1194,7 +1225,7 @@ impl GpuBackend for WgpuBackend {
             ),
             LumaLowpass::Box => {
                 self.record_dispatch("luma_box");
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+                let mut pass = encoder.begin_compute_pass(&self.pass_descriptor("luma_box"));
                 pass.set_pipeline(&self.luma_box_pipeline);
                 pass.set_bind_group(0, main_bind_group, &[]);
                 pass.set_bind_group(1, base_params, &[]);
@@ -1212,10 +1243,7 @@ impl GpuBackend for WgpuBackend {
 
         {
             self.record_dispatch("chroma_into_luma");
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("chroma_into_luma pass"),
-                timestamp_writes: None,
-            });
+            let mut cpass = encoder.begin_compute_pass(&self.pass_descriptor("chroma_into_luma"));
             cpass.set_pipeline(&self.chroma_into_luma_pipeline);
             cpass.set_bind_group(0, main_bind_group, &[]);
             cpass.set_bind_group(1, base_params, &[]);
@@ -1360,7 +1388,7 @@ impl GpuBackend for WgpuBackend {
                 ChromaDemodulationFilter::OneLineComb => &self.luma_into_chroma_one_line_pipeline,
                 ChromaDemodulationFilter::TwoLineComb => &self.luma_into_chroma_two_line_pipeline,
             };
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let mut pass = encoder.begin_compute_pass(&self.pass_descriptor("luma_into_chroma"));
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, main_bind_group, &[]);
             pass.set_bind_group(1, demod_params, &[]);
@@ -1436,7 +1464,7 @@ impl GpuBackend for WgpuBackend {
             self.record_dispatch("chroma_phase_error");
             params.noise_frequency = effect.chroma_phase_error;
             params.noise_intensity = 0.0;
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let mut pass = encoder.begin_compute_pass(&self.pass_descriptor("chroma_phase_error"));
             pass.set_pipeline(&self.chroma_phase_pipeline);
             pass.set_bind_group(0, main_bind_group, &[]);
             pass.set_bind_group(1, self.get_params_bind_group(&params, &mut ring_idx), &[]);
@@ -1470,10 +1498,7 @@ impl GpuBackend for WgpuBackend {
             encoder.copy_buffer_to_buffer(&frame.i_buffer, 0, &frame.scratch_buffers[1], 0, size);
             encoder.copy_buffer_to_buffer(&frame.q_buffer, 0, &frame.scratch_buffers[2], 0, size);
 
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("chroma_delay pass"),
-                timestamp_writes: None,
-            });
+            let mut cpass = encoder.begin_compute_pass(&self.pass_descriptor("chroma_delay"));
             cpass.set_pipeline(&self.chroma_delay_pipeline);
             cpass.set_bind_group(0, main_bind_group, &[]);
             cpass.set_bind_group(1, self.get_params_bind_group(&params, &mut ring_idx), &[]);
@@ -1573,10 +1598,7 @@ impl GpuBackend for WgpuBackend {
 
         if effect.chroma_vert_blend && frame.full_height >= 2 {
             self.record_dispatch("chroma_vert_blend");
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("chroma_vert_blend pass"),
-                timestamp_writes: None,
-            });
+            let mut cpass = encoder.begin_compute_pass(&self.pass_descriptor("chroma_vert_blend"));
             cpass.set_pipeline(&self.chroma_vert_blend_pipeline);
             cpass.set_bind_group(0, &frame.chroma_loss_bind_group, &[]);
             cpass.set_bind_group(1, self.get_params_bind_group(&params, &mut ring_idx), &[]);
@@ -1594,6 +1616,9 @@ impl GpuBackend for WgpuBackend {
 
         if self.pending_error.borrow().is_some() {
             return;
+        }
+        if let Some(profiler) = &self.profiler {
+            profiler.resolve(&mut encoder);
         }
         self.queue.submit(Some(encoder.finish()));
         self.submitted_effects += 1;

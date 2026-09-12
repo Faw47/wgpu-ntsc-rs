@@ -1,3 +1,7 @@
+#[cfg(feature = "gpu-wgpu")]
+pub mod block_filter;
+#[cfg(feature = "gpu-wgpu")]
+pub mod profiling;
 use crate::{settings::standard::NtscEffect, yiq_fielding::YiqView};
 
 #[cfg(feature = "gpu-wgpu")]
