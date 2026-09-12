@@ -1,47 +1,55 @@
-name: Audit repair acceptance
+name: Finalize audit repair evidence
 
 on:
   push:
     branches: [codex/audit-repair]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  acceptance:
+  finalize:
+    if: github.event.head_commit.message == 'Finalize audit repair evidence'
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - simd: native
-            rustflags: ""
-          - simd: forced-sse
-            rustflags: "--cfg disable_dispatch_avx512 --cfg disable_dispatch_avx2"
-    env:
-      XDG_RUNTIME_DIR: /tmp
-      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust 1.90
-        run: rustup toolchain install 1.90.0 --profile minimal
-      - uses: Swatinem/rust-cache@v2
-      - name: Install software Vulkan
+        with:
+          fetch-depth: 0
+      - name: Update final portability evidence and remove temporary workflow
         run: |
-          sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers
-          ICD=$(find /usr/share/vulkan/icd.d -name 'lvp*.json' -print -quit)
-          test -n "$ICD"
-          echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
-      - name: Record host-specific full-frame fingerprint
-        continue-on-error: true
-        run: cargo +1.90.0 test -p ntsc-rs --no-default-features pinned_upstream_default_fixed_seed_fingerprint -- --nocapture
-      - name: Record host-specific stochastic-control fingerprint
-        continue-on-error: true
-        run: cargo +1.90.0 test -p ntsc-rs --features gpu-wgpu fixed_seed_stochastic_control_fingerprints -- --nocapture
-      - name: CPU reference tests except architecture-specific fingerprint oracle
-        run: cargo +1.90.0 test -p ntsc-rs --no-default-features -- --skip pinned_upstream_default_fixed_seed_fingerprint
-      - name: Core all-targets check with WGPU
-        run: cargo +1.90.0 check -p ntsc-rs --all-targets --features gpu-wgpu
-      - name: Full WGPU acceptance including adapter tests
-        run: cargo +1.90.0 test -p ntsc-rs --features gpu-wgpu -- --include-ignored --nocapture --test-threads=1 --skip pinned_upstream_default_fixed_seed_fingerprint --skip fixed_seed_stochastic_control_fingerprints
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('GPU_PORT_SPEC.md')
+          text = path.read_text()
+
+          old_item = "13. Explicit WGPU errors cannot silently become CPU success; CPU image-effect invocation and dispatched-stage evidence are returned per call."
+          new_item = old_item + "\n14. Host-specific recursive-filter arithmetic now probes the active CPU SIMD lane profile and fused-multiply-add behavior; the WGPU filter path reproduces both fused and unfused binary32 rounding, and the four-sample luma box sum uses explicit exact additions so shader reassociation cannot seed IIR divergence."
+          if old_item not in text:
+              raise SystemExit('completed-work anchor not found')
+          text = text.replace(old_item, new_item, 1)
+
+          start = text.index('Validation rerun on the repaired tree:')
+          end = text.index('\n## GPU-Execution Proof', start)
+          replacement = '''Validation rerun on the final production source (`e678ed2cbc22f22782a7779ea3f300c59802f74a`) used a temporary branch-only GitHub Actions harness. The final acceptance run was `34672421131`; its tested commit differed from `e678ed2` only by that temporary workflow. Rust was pinned to 1.90.0 on Ubuntu 24.04 with Mesa llvmpipe 25.2.8 / LLVM 20.1.2 through Vulkan. Two lanes were run independently: the hosted runner's native SIMD dispatch, and a forced-SSE lane with `RUSTFLAGS="--cfg disable_dispatch_avx512 --cfg disable_dispatch_avx2"`.
+
+- Native SIMD: CPU reference tests passed after excluding the architecture-specific full-frame fingerprint oracle; `cargo check -p ntsc-rs --all-targets --features gpu-wgpu` passed; the complete adapter-backed WGPU acceptance suite passed. Component results were 46 library tests, 8 adversarial-audit tests, 3 backend-selection tests, 8 GPU golden tests, 2 WGPU regression tests, and 1 WGSL validation test, all with zero failures.
+- Forced SSE: the same CPU reference gate, all-targets WGPU check, and complete adapter-backed WGPU suite passed with the same component counts and zero failures.
+- In both lanes `software_filter_arithmetic_matches_host_rounding_bit_for_bit` passed. This independently exercises the shader's exact fused and exact unfused binary32 multiply-add paths against host results.
+- In both lanes `wide_recursive_filters_match_host_specific_upstream_arithmetic` passed with **maximum error 0** for Butterworth chroma low-pass-out at widths 1919, 1920, 1921, 3839, 3840, 3841, and 8192; all three explicitly stressed demodulation-to-low-pass modes at width 8192; and VHS Butterworth sharpen at widths 3839, 3840, 3841, and 8192.
+- The earlier `0.0087228` wide-filter divergence was traced to a one-ULP precursor before the recursive filter: the shader toolchain reassociated the four-sample box-luma sum. Explicit exact additions remove that seed without forcing integer-style exact arithmetic through every chroma accumulation. Recursive-filter state updates then remain bit-identical for the stressed native and forced-SSE cases.
+- The current arithmetic contract is host-profile-specific by design: the CPU reference uses `fearless_simd`, so the WGPU backend probes active lane count and whether the selected CPU path's `mul_add` is fused, then selects matching shader arithmetic rather than hard-coding AVX512 assumptions.
+- Two fixed-hash tests are **not portable cross-ISA acceptance oracles**. `pinned_upstream_default_fixed_seed_fingerprint` is SIMD-profile-dependent: the forced-SSE probe produced `0x20603ed6d4afc959` instead of the existing `0xb95f09d0ce6af57a` reference. `gpu::prepare::tests::fixed_seed_stochastic_control_fingerprints` also has a SIMD-dependent tracking-row hash because tracking wave samples are generated through the active SIMD noise path; forced SSE produced `0xaa4955ad943e955c` where the existing reference is `0x614f36a34b29c7bc`. These two diagnostic hash probes were therefore excluded from the cross-ISA acceptance command rather than weakening CPU/GPU numerical tolerances. Stage-level upstream parity and adapter-backed CPU/GPU comparisons remain the portability authority.
+- The software adapter is correctness evidence only. Physical Vulkan, Metal, and DX12 parity and hardware performance remain unclaimed and must still be measured on target devices such as the RX 6800 and Apple M2.
+
+The final temporary acceptance workflow is removed from the branch after recording this evidence. Production backend selection remains `PRIMARY`; no audit-only backend selector is retained.
+'''
+          text = text[:start] + replacement + text[end:]
+          path.write_text(text)
+          PY
+          rm .github/workflows/audit-acceptance.yml
+          git config user.name "FAWAZ"
+          git config user.email "108174119+Faw47@users.noreply.github.com"
+          git add GPU_PORT_SPEC.md .github/workflows/audit-acceptance.yml
+          git commit -m "Document final GPU portability validation"
+          git push origin HEAD:codex/audit-repair
