@@ -1,0 +1,32 @@
+name: Audit repair acceptance
+
+on:
+  push:
+    branches: [codex/audit-repair]
+
+permissions:
+  contents: read
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    env:
+      XDG_RUNTIME_DIR: /tmp
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.90
+        run: rustup toolchain install 1.90.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Install software Vulkan
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers
+          ICD=$(find /usr/share/vulkan/icd.d -name 'lvp*.json' -print -quit)
+          test -n "$ICD"
+          echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
+      - name: CPU reference tests
+        run: cargo +1.90.0 test -p ntsc-rs --no-default-features
+      - name: Core all-targets check with WGPU
+        run: cargo +1.90.0 check -p ntsc-rs --all-targets --features gpu-wgpu
+      - name: Full WGPU acceptance including adapter tests
+        run: cargo +1.90.0 test -p ntsc-rs --features gpu-wgpu -- --include-ignored --nocapture --test-threads=1
