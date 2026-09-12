@@ -36,9 +36,12 @@ jobs:
       - name: Record host-specific full-frame fingerprint
         continue-on-error: true
         run: cargo +1.90.0 test -p ntsc-rs --no-default-features pinned_upstream_default_fixed_seed_fingerprint -- --nocapture
-      - name: CPU reference tests except nonportable fingerprint oracle
+      - name: Record host-specific stochastic-control fingerprint
+        continue-on-error: true
+        run: cargo +1.90.0 test -p ntsc-rs --features gpu-wgpu fixed_seed_stochastic_control_fingerprints -- --nocapture
+      - name: CPU reference tests except architecture-specific fingerprint oracle
         run: cargo +1.90.0 test -p ntsc-rs --no-default-features -- --skip pinned_upstream_default_fixed_seed_fingerprint
       - name: Core all-targets check with WGPU
         run: cargo +1.90.0 check -p ntsc-rs --all-targets --features gpu-wgpu
       - name: Full WGPU acceptance including adapter tests
-        run: cargo +1.90.0 test -p ntsc-rs --features gpu-wgpu -- --include-ignored --nocapture --test-threads=1 --skip pinned_upstream_default_fixed_seed_fingerprint
+        run: cargo +1.90.0 test -p ntsc-rs --features gpu-wgpu -- --include-ignored --nocapture --test-threads=1 --skip pinned_upstream_default_fixed_seed_fingerprint --skip fixed_seed_stochastic_control_fingerprints
