@@ -1,7 +1,7 @@
 use crate::{
     gpu::{GpuBackend, GpuFrame},
     noise_seeds,
-    settings::standard::NtscEffect,
+    settings::standard::{ChromaDemodulationFilter, NtscEffect},
     yiq_fielding::YiqView,
 };
 
@@ -195,12 +195,22 @@ pub struct FilterCoeffs {
     pub initial_condition_mode: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct RgbaOutputParams {
+    width: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
 pub struct WgpuFrame {
     pub y_buffer: wgpu::Buffer,
     pub i_buffer: wgpu::Buffer,
     pub q_buffer: wgpu::Buffer,
     pub scratch_buffers: [wgpu::Buffer; 3],
     pub staging_buffers: [wgpu::Buffer; 3],
+    rgba_output_bind_group: wgpu::BindGroup,
     pub main_bind_group: wgpu::BindGroup,
     pub i_pass_bind_group: wgpu::BindGroup,
     pub q_pass_bind_group: wgpu::BindGroup,
@@ -219,6 +229,10 @@ pub struct PendingReadback {
     receivers: [std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>; 3],
 }
 
+pub struct PendingRgba8Readback {
+    receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
 fn filter_arithmetic_source() -> &'static str {
     let source = include_str!("shaders/filter_plane.wgsl");
     let start = source
@@ -230,6 +244,56 @@ fn filter_arithmetic_source() -> &'static str {
     &source[start..end]
 }
 
+fn filter_shader_header() -> &'static str {
+    let source = include_str!("shaders/filter_plane.wgsl");
+    let start = source
+        .find("// A four-word unsigned integer")
+        .expect("filter arithmetic start marker");
+    &source[..start]
+}
+
+fn filter_shader_body() -> &'static str {
+    let source = include_str!("shaders/filter_plane.wgsl");
+    let start = source.find("@compute").expect("filter compute marker");
+    &source[start..]
+}
+
+fn filter_shader_for_workgroup(workgroup_size: u32) -> String {
+    include_str!("shaders/filter_plane.wgsl").replace(
+        "@compute @workgroup_size(64, 1, 1)",
+        &format!("@compute @workgroup_size({workgroup_size}, 1, 1)"),
+    )
+}
+
+fn filter_shader_body_for_workgroup(workgroup_size: u32) -> String {
+    filter_shader_body().replace(
+        "@compute @workgroup_size(64, 1, 1)",
+        &format!("@compute @workgroup_size({workgroup_size}, 1, 1)"),
+    )
+}
+
+fn fast_filter_arithmetic_source() -> &'static str {
+    r#"
+// Fast-math path. These helpers deliberately use the adapter's native f32
+// arithmetic and are not a bit-exact parity target. The strict path remains
+// the default and is assembled from filter_plane.wgsl above.
+fn exact_add_f32(a: f32, b: f32) -> f32 {
+    return a + b;
+}
+
+fn exact_fma_f32(a: f32, b: f32, c: f32) -> f32 {
+    return fma(a, b, c);
+}
+
+fn upstream_mul_add(a: f32, b: f32, c: f32, fused: bool) -> f32 {
+    if (fused) {
+        return fma(a, b, c);
+    }
+    return a * b + c;
+}
+"#
+}
+
 impl GpuFrame for WgpuFrame {
     fn download(&self, dst: &mut YiqView) {
         self.finish_download(dst, self.enqueue_download());
@@ -237,25 +301,47 @@ impl GpuFrame for WgpuFrame {
 }
 
 impl WgpuFrame {
-    /// Schedule a readback without waiting, allowing independent field work to overlap.
-    pub fn enqueue_download(&self) -> PendingReadback {
-        let size = (self.width * self.height * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+    fn download_size(&self) -> wgpu::BufferAddress {
+        (self.width * self.height * std::mem::size_of::<f32>()) as wgpu::BufferAddress
+    }
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("download encoder"),
-            });
-
+    fn record_download(&self, encoder: &mut wgpu::CommandEncoder) {
+        let size = self.download_size();
         for (source, staging) in [&self.y_buffer, &self.i_buffer, &self.q_buffer]
             .into_iter()
             .zip(&self.staging_buffers)
         {
             encoder.copy_buffer_to_buffer(source, 0, staging, 0, size);
         }
+    }
 
-        self.queue.submit(Some(encoder.finish()));
+    fn record_rgba8_download(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::ComputePipeline,
+    ) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("YIQ to RGBA8 output"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.rgba_output_bind_group, &[]);
+        pass.dispatch_workgroups(
+            (self.width as u32).div_ceil(16),
+            (self.height as u32).div_ceil(16),
+            1,
+        );
+        drop(pass);
+        encoder.copy_buffer_to_buffer(
+            &self.scratch_buffers[0],
+            0,
+            &self.staging_buffers[0],
+            0,
+            self.rgba_output_size(),
+        );
+    }
 
+    fn begin_download_mapping(&self) -> PendingReadback {
         let receivers = std::array::from_fn(|plane| {
             let buffer_slice = self.staging_buffers[plane].slice(..);
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -266,6 +352,34 @@ impl WgpuFrame {
         });
 
         PendingReadback { receivers }
+    }
+
+    fn rgba_output_size(&self) -> wgpu::BufferAddress {
+        (self.width * self.height * std::mem::size_of::<u32>()) as wgpu::BufferAddress
+    }
+
+    fn begin_rgba8_mapping(&self) -> PendingRgba8Readback {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.staging_buffers[0]
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        PendingRgba8Readback { receiver }
+    }
+
+    /// Schedule a readback without waiting, allowing independent field work to overlap.
+    pub fn enqueue_download(&self) -> PendingReadback {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("download encoder"),
+            });
+
+        self.record_download(&mut encoder);
+
+        self.queue.submit(Some(encoder.finish()));
+        self.begin_download_mapping()
     }
 
     pub fn try_finish_download(
@@ -331,7 +445,7 @@ impl WgpuFrame {
             self.staging_buffers.iter().for_each(wgpu::Buffer::unmap);
             return Err(WgpuBackendError::Runtime(runtime_errors.join("; ")));
         }
-        let size = (self.width * self.height * std::mem::size_of::<f32>()) as u64;
+        let size = self.download_size() as u64;
         for (staging, destination) in
             self.staging_buffers
                 .iter()
@@ -349,6 +463,72 @@ impl WgpuFrame {
         self.try_finish_download(dst, pending)
             .expect("WGPU readback failed");
     }
+
+    pub fn try_finish_rgba8_download(
+        &self,
+        dst: &mut [u8],
+        pending: PendingRgba8Readback,
+    ) -> Result<(), WgpuBackendError> {
+        let expected = self.rgba_output_size() as usize;
+        if dst.len() < expected {
+            return Err(WgpuBackendError::Readback(format!(
+                "RGBA8 destination is {} bytes, frame requires {expected}",
+                dst.len()
+            )));
+        }
+        if let Err(error) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
+            self.staging_buffers[0].unmap();
+            if let Some(message) = self
+                .device_lost
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return Err(WgpuBackendError::DeviceLost(message));
+            }
+            return Err(WgpuBackendError::Runtime(error.to_string()));
+        }
+        match pending.receiver.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                self.staging_buffers[0].unmap();
+                return Err(WgpuBackendError::Readback(error.to_string()));
+            }
+            Err(_) => {
+                self.staging_buffers[0].unmap();
+                return Err(WgpuBackendError::Readback(
+                    "RGBA8 mapping callback was dropped".to_owned(),
+                ));
+            }
+        }
+        if let Some(error) = self
+            .device_lost
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            self.staging_buffers[0].unmap();
+            return Err(WgpuBackendError::DeviceLost(error));
+        }
+        let runtime_errors = {
+            let mut errors = self
+                .runtime_errors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *errors)
+        };
+        if !runtime_errors.is_empty() {
+            self.staging_buffers[0].unmap();
+            return Err(WgpuBackendError::Runtime(runtime_errors.join("; ")));
+        }
+        let data = self.staging_buffers[0]
+            .slice(..expected as u64)
+            .get_mapped_range();
+        dst[..expected].copy_from_slice(&data);
+        drop(data);
+        self.staging_buffers[0].unmap();
+        Ok(())
+    }
 }
 
 pub struct WgpuBackend {
@@ -360,15 +540,26 @@ pub struct WgpuBackend {
     luma_into_chroma_notch_pipeline: wgpu::ComputePipeline,
     luma_into_chroma_one_line_pipeline: wgpu::ComputePipeline,
     luma_into_chroma_two_line_pipeline: wgpu::ComputePipeline,
+    luma_into_chroma_box_fast_pipeline: wgpu::ComputePipeline,
+    luma_into_chroma_notch_fast_pipeline: wgpu::ComputePipeline,
+    luma_into_chroma_one_line_fast_pipeline: wgpu::ComputePipeline,
+    luma_into_chroma_two_line_fast_pipeline: wgpu::ComputePipeline,
     luma_box_pipeline: wgpu::ComputePipeline,
     chroma_phase_pipeline: wgpu::ComputePipeline,
     chroma_delay_pipeline: wgpu::ComputePipeline,
     filter_plane_pipeline: wgpu::ComputePipeline,
+    filter_plane_fast_pipeline: wgpu::ComputePipeline,
     chroma_vert_blend_pipeline: wgpu::ComputePipeline,
     filter_coeffs_bind_group_layout: wgpu::BindGroupLayout,
+    rgba_output_bind_group_layout: wgpu::BindGroupLayout,
+    rgba_output_pipeline: wgpu::ComputePipeline,
     params_ring_buffer: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     row_layout: wgpu::BindGroupLayout,
     row_pipelines: std::collections::HashMap<&'static str, wgpu::ComputePipeline>,
+    control_rows: std::cell::RefCell<Vec<super::prepare::Row>>,
+    control_words: std::cell::RefCell<Vec<u32>>,
+    control_floats: std::cell::RefCell<Vec<f32>>,
+    control_snow: std::cell::RefCell<Option<super::prepare::SnowScratch>>,
     data_cache: std::cell::RefCell<Vec<(wgpu::Buffer, wgpu::BindGroup, u64)>>,
     data_index: std::cell::Cell<usize>,
     filter_cache: std::cell::RefCell<std::collections::HashMap<[u32; 16], wgpu::BindGroup>>,
@@ -377,6 +568,8 @@ pub struct WgpuBackend {
     pub requested_limits: wgpu::Limits,
     simd_lane_count: u32,
     simd_mul_add_fused: bool,
+    fast_math: bool,
+    filter_workgroup_size: u32,
     runtime_errors: Arc<std::sync::Mutex<Vec<String>>>,
     pub(crate) device_lost: Arc<std::sync::Mutex<Option<String>>>,
     dispatch_stages: std::cell::RefCell<Vec<&'static str>>,
@@ -387,6 +580,52 @@ pub struct WgpuBackend {
 }
 
 impl WgpuBackend {
+    /// Submit all requested field readbacks in one command buffer.
+    ///
+    /// The effect work for each field is already submitted by `apply_effect`.
+    /// Combining the copy commands here removes one queue submission per field,
+    /// which matters for interlaced frames where both fields are active.
+    pub fn enqueue_downloads<const N: usize>(
+        &self,
+        frames: [&WgpuFrame; N],
+    ) -> [PendingReadback; N] {
+        assert!(N > 0, "at least one frame is required for a readback batch");
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("batched download encoder"),
+            });
+        for frame in frames.iter() {
+            frame.record_download(&mut encoder);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        frames.map(WgpuFrame::begin_download_mapping)
+    }
+
+    /// Convert processed YIQ planes to packed RGBA8 on the adapter and submit
+    /// the copies as one command buffer. This is useful for preview paths that
+    /// already consume an 8-bit RGBA image and would otherwise repeat the
+    /// YIQ-to-RGB matrix on the CPU.
+    pub fn enqueue_rgba8_downloads<const N: usize>(
+        &self,
+        frames: [&WgpuFrame; N],
+    ) -> [PendingRgba8Readback; N] {
+        assert!(
+            N > 0,
+            "at least one frame is required for an RGBA8 readback batch"
+        );
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("batched RGBA8 download encoder"),
+            });
+        for frame in frames.iter() {
+            frame.record_rgba8_download(&mut encoder, &self.rgba_output_pipeline);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        frames.map(WgpuFrame::begin_rgba8_mapping)
+    }
+
     /// Reuse frame buffers and bind groups across frames of the same dimensions.
     pub fn upload_into(&self, src: &YiqView, frame: &mut WgpuFrame) {
         assert_eq!(
@@ -400,6 +639,24 @@ impl WgpuBackend {
             .write_buffer(&frame.i_buffer, 0, bytemuck::cast_slice(src.i));
         self.queue
             .write_buffer(&frame.q_buffer, 0, bytemuck::cast_slice(src.q));
+    }
+
+    /// Submit one effect and enqueue its YIQ readback without waiting for the
+    /// device. Callers can keep several `PendingReadback` values in flight and
+    /// finish them later in submission order to overlap independent frames.
+    pub fn apply_effect_async(
+        &mut self,
+        effect: &NtscEffect,
+        frame: &mut WgpuFrame,
+        frame_num: usize,
+        scale_factor: [f32; 2],
+    ) -> Result<PendingReadback, WgpuBackendError> {
+        self.begin_execution();
+        GpuBackend::apply_effect(self, effect, frame, frame_num, scale_factor);
+        if let Some(error) = self.take_pending_error() {
+            return Err(error);
+        }
+        Ok(frame.enqueue_download())
     }
 
     pub fn new() -> Option<Self> {
@@ -426,6 +683,13 @@ impl WgpuBackend {
             .map_err(|error| WgpuBackendError::Initialization(error.to_string()))?;
 
         let adapter_limits = adapter.limits();
+        let requested_filter_workgroup = std::env::var("NTSC_WGPU_FILTER_WORKGROUP")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| matches!(value, 32 | 64 | 128 | 256));
+        let filter_workgroup_size = requested_filter_workgroup
+            .filter(|value| *value <= adapter_limits.max_compute_workgroup_size_x)
+            .unwrap_or(64);
         let mut requested_limits = wgpu::Limits::default();
         requested_limits.max_storage_buffer_binding_size =
             adapter_limits.max_storage_buffer_binding_size;
@@ -459,6 +723,10 @@ impl WgpuBackend {
         });
 
         let (simd_lane_count, simd_mul_add_fused) = crate::filter::active_gpu_simd_profile();
+        let fast_math = matches!(
+            std::env::var("NTSC_WGPU_FAST_MATH").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
 
         let chroma_into_luma_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chroma_into_luma shader"),
@@ -477,6 +745,19 @@ impl WgpuBackend {
             ),
         });
 
+        let luma_into_chroma_fast_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("luma_into_chroma fast-math shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    format!(
+                        "{}\n{}",
+                        fast_filter_arithmetic_source(),
+                        include_str!("shaders/luma_into_chroma.wgsl")
+                    )
+                    .into(),
+                ),
+            });
+
         let chroma_delay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chroma_delay shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/chroma_delay.wgsl").into()),
@@ -484,7 +765,22 @@ impl WgpuBackend {
 
         let filter_plane_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("filter_plane shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/filter_plane.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                filter_shader_for_workgroup(filter_workgroup_size).into(),
+            ),
+        });
+
+        let filter_plane_fast_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("filter_plane fast-math shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}\n{}",
+                    filter_shader_header(),
+                    fast_filter_arithmetic_source(),
+                    filter_shader_body_for_workgroup(filter_workgroup_size)
+                )
+                .into(),
+            ),
         });
 
         let simplex_src = include_str!("shaders/simplex.wgsl");
@@ -492,6 +788,18 @@ impl WgpuBackend {
         let chroma_loss_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chroma vertical blend"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/chroma_loss_blend.wgsl").into()),
+        });
+
+        let rgba_output_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("YIQ to RGBA8 output"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!(
+                    "{}\n{}",
+                    filter_arithmetic_source(),
+                    include_str!("shaders/yiq_to_rgba8.wgsl")
+                )
+                .into(),
+            ),
         });
 
         let image_layout_entries: [wgpu::BindGroupLayoutEntry; IMAGE_STORAGE_BINDINGS as usize] =
@@ -539,6 +847,63 @@ impl WgpuBackend {
                     },
                     count: None,
                 }],
+            });
+
+        let rgba_output_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("YIQ to RGBA8 output layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
 
         let effect_pipeline_layout =
@@ -629,19 +994,52 @@ impl WgpuBackend {
                 cache: None,
             });
 
-        let make_demodulation = |entry: &'static str| {
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(entry),
-                layout: Some(&effect_pipeline_layout),
-                module: &luma_into_chroma_shader,
-                entry_point: Some(entry),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        };
-        let luma_into_chroma_notch_pipeline = make_demodulation("demodulate_notch");
-        let luma_into_chroma_one_line_pipeline = make_demodulation("demodulate_one_line_comb");
-        let luma_into_chroma_two_line_pipeline = make_demodulation("demodulate_two_line_comb");
+        let make_demodulation =
+            |module: &wgpu::ShaderModule, entry: &'static str, label: &'static str| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&effect_pipeline_layout),
+                    module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    cache: None,
+                })
+            };
+        let luma_into_chroma_notch_pipeline = make_demodulation(
+            &luma_into_chroma_shader,
+            "demodulate_notch",
+            "demodulate_notch",
+        );
+        let luma_into_chroma_one_line_pipeline = make_demodulation(
+            &luma_into_chroma_shader,
+            "demodulate_one_line_comb",
+            "demodulate_one_line_comb",
+        );
+        let luma_into_chroma_two_line_pipeline = make_demodulation(
+            &luma_into_chroma_shader,
+            "demodulate_two_line_comb",
+            "demodulate_two_line_comb",
+        );
+        let luma_into_chroma_box_fast_pipeline = make_demodulation(
+            &luma_into_chroma_fast_shader,
+            "demodulate_box",
+            "demodulate_box fast-math",
+        );
+        let luma_into_chroma_notch_fast_pipeline = make_demodulation(
+            &luma_into_chroma_fast_shader,
+            "demodulate_notch",
+            "demodulate_notch fast-math",
+        );
+        let luma_into_chroma_one_line_fast_pipeline = make_demodulation(
+            &luma_into_chroma_fast_shader,
+            "demodulate_one_line_comb",
+            "demodulate_one_line_comb fast-math",
+        );
+        let luma_into_chroma_two_line_fast_pipeline = make_demodulation(
+            &luma_into_chroma_fast_shader,
+            "demodulate_two_line_comb",
+            "demodulate_two_line_comb fast-math",
+        );
         let luma_box_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("input luma box"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/luma_box.wgsl").into()),
@@ -688,12 +1086,38 @@ impl WgpuBackend {
                 cache: None,
             });
 
+        let filter_plane_fast_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("filter_plane fast-math pipeline"),
+                layout: Some(&filter_plane_pipeline_layout),
+                module: &filter_plane_fast_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         let chroma_vert_blend_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("chroma_vert_blend pipeline"),
                 layout: Some(&effect_pipeline_layout),
                 module: &chroma_loss_shader,
                 entry_point: Some("chroma_vert_blend"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let rgba_output_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("YIQ to RGBA8 output layout"),
+                bind_group_layouts: &[&rgba_output_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let rgba_output_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("YIQ to RGBA8 output pipeline"),
+                layout: Some(&rgba_output_pipeline_layout),
+                module: &rgba_output_shader,
+                entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -725,7 +1149,10 @@ impl WgpuBackend {
         };
 
         let mut params_ring_buffer = Vec::new();
-        for _ in 0..32 {
+        // One effect submission currently consumes at most four distinct
+        // parameter snapshots. Keep a small cushion without allocating a
+        // 32-slot ring that can never be used by this command graph.
+        for _ in 0..8 {
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("shader params buffer"),
                 contents: bytemuck::cast_slice(&[params]),
@@ -751,15 +1178,26 @@ impl WgpuBackend {
             luma_into_chroma_notch_pipeline,
             luma_into_chroma_one_line_pipeline,
             luma_into_chroma_two_line_pipeline,
+            luma_into_chroma_box_fast_pipeline,
+            luma_into_chroma_notch_fast_pipeline,
+            luma_into_chroma_one_line_fast_pipeline,
+            luma_into_chroma_two_line_fast_pipeline,
             luma_box_pipeline,
             chroma_phase_pipeline,
             chroma_delay_pipeline,
             filter_plane_pipeline,
+            filter_plane_fast_pipeline,
             chroma_vert_blend_pipeline,
             filter_coeffs_bind_group_layout,
+            rgba_output_bind_group_layout,
+            rgba_output_pipeline,
             params_ring_buffer,
             row_layout,
             row_pipelines,
+            control_rows: Default::default(),
+            control_words: Default::default(),
+            control_floats: Default::default(),
+            control_snow: Default::default(),
             data_cache: Default::default(),
             data_index: Default::default(),
             filter_cache: Default::default(),
@@ -768,6 +1206,8 @@ impl WgpuBackend {
             requested_limits,
             simd_lane_count,
             simd_mul_add_fused,
+            fast_math,
+            filter_workgroup_size,
             runtime_errors,
             device_lost,
             dispatch_stages: Default::default(),
@@ -807,6 +1247,46 @@ impl WgpuBackend {
         wgpu::ComputePassDescriptor {
             label: Some(stage),
             timestamp_writes: self.profiler.as_ref().and_then(|p| p.writes(stage)),
+        }
+    }
+
+    pub fn fast_math_enabled(&self) -> bool {
+        self.fast_math
+    }
+
+    pub fn filter_workgroup_size(&self) -> u32 {
+        self.filter_workgroup_size
+    }
+
+    fn active_filter_pipeline(&self) -> &wgpu::ComputePipeline {
+        if self.fast_math {
+            &self.filter_plane_fast_pipeline
+        } else {
+            &self.filter_plane_pipeline
+        }
+    }
+
+    fn active_demodulation_pipeline(
+        &self,
+        demodulation: ChromaDemodulationFilter,
+    ) -> &wgpu::ComputePipeline {
+        match (self.fast_math, demodulation) {
+            (false, ChromaDemodulationFilter::Box) => &self.luma_into_chroma_box_pipeline,
+            (false, ChromaDemodulationFilter::Notch) => &self.luma_into_chroma_notch_pipeline,
+            (false, ChromaDemodulationFilter::OneLineComb) => {
+                &self.luma_into_chroma_one_line_pipeline
+            }
+            (false, ChromaDemodulationFilter::TwoLineComb) => {
+                &self.luma_into_chroma_two_line_pipeline
+            }
+            (true, ChromaDemodulationFilter::Box) => &self.luma_into_chroma_box_fast_pipeline,
+            (true, ChromaDemodulationFilter::Notch) => &self.luma_into_chroma_notch_fast_pipeline,
+            (true, ChromaDemodulationFilter::OneLineComb) => {
+                &self.luma_into_chroma_one_line_fast_pipeline
+            }
+            (true, ChromaDemodulationFilter::TwoLineComb) => {
+                &self.luma_into_chroma_two_line_fast_pipeline
+            }
         }
     }
 
@@ -914,13 +1394,13 @@ impl WgpuBackend {
         });
 
         let mut cpass = encoder.begin_compute_pass(&self.pass_descriptor("filter_plane"));
-        cpass.set_pipeline(&self.filter_plane_pipeline);
+        cpass.set_pipeline(self.active_filter_pipeline());
         cpass.set_bind_group(0, &frame.main_bind_group, &[]);
         cpass.set_bind_group(1, params_bind_group, &[]);
         cpass.set_bind_group(2, &*coeffs_bind_group, &[]);
 
         let rows = frame.height as u32;
-        cpass.dispatch_workgroups(rows.div_ceil(64), 1, 1);
+        cpass.dispatch_workgroups(rows.div_ceil(self.filter_workgroup_size), 1, 1);
     }
 
     fn dispatch_data(
@@ -1099,6 +1579,18 @@ impl GpuBackend for WgpuBackend {
                 mapped_at_creation: false,
             })
         });
+        let rgba_params = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("rgba8 output params"),
+                contents: bytemuck::bytes_of(&RgbaOutputParams {
+                    width: src.dimensions.0 as u32,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                }),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
         let make_bind_group = |label, images: [&wgpu::Buffer; 3]| {
             let resources = [
@@ -1127,6 +1619,32 @@ impl GpuBackend for WgpuBackend {
             make_bind_group("q pass bind group", [&q_buffer, &y_buffer, &i_buffer]);
         let chroma_loss_bind_group =
             make_bind_group("chroma loss bind group", [&i_buffer, &q_buffer, &y_buffer]);
+        let rgba_output_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("YIQ to RGBA8 output bind group"),
+            layout: &self.rgba_output_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: y_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: i_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: q_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: scratch_buffers[0].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: rgba_params.as_entire_binding(),
+                },
+            ],
+        });
 
         WgpuFrame {
             y_buffer,
@@ -1134,6 +1652,7 @@ impl GpuBackend for WgpuBackend {
             q_buffer,
             scratch_buffers,
             staging_buffers,
+            rgba_output_bind_group,
             main_bind_group,
             i_pass_bind_group,
             q_pass_bind_group,
@@ -1263,7 +1782,8 @@ impl GpuBackend for WgpuBackend {
         let sy = params.vertical_scale;
         if let Some(noise) = &effect.composite_noise {
             self.record_cpu_control("composite_noise_rows");
-            let rows = prepare::noise(
+            let mut rows = self.control_rows.borrow_mut();
+            prepare::noise_into(
                 effect.random_seed,
                 frame_num,
                 noise_seeds::VIDEO_COMPOSITE,
@@ -1271,6 +1791,7 @@ impl GpuBackend for WgpuBackend {
                 frame.height,
                 sx,
                 noise,
+                &mut rows,
             );
             self.dispatch_data(
                 &mut encoder,
@@ -1283,7 +1804,11 @@ impl GpuBackend for WgpuBackend {
         }
         if effect.snow_intensity > 0.0 && sx > 0.0 {
             self.record_cpu_control("snow_events_and_values");
-            let events = prepare::snow(
+            let mut events = self.control_words.borrow_mut();
+            let mut snow = self.control_snow.borrow_mut();
+            let snow =
+                snow.get_or_insert_with(|| prepare::SnowScratch::new(frame.width, frame.height));
+            prepare::snow_into_with_scratch(
                 effect.random_seed,
                 frame_num,
                 frame.width,
@@ -1291,6 +1816,8 @@ impl GpuBackend for WgpuBackend {
                 effect.snow_intensity * 0.01,
                 effect.snow_anisotropy,
                 sx,
+                snow,
+                &mut events,
             );
             self.dispatch_data(
                 &mut encoder,
@@ -1303,7 +1830,8 @@ impl GpuBackend for WgpuBackend {
         }
         if let Some(head) = &effect.head_switching {
             self.record_cpu_control("head_switching_rows");
-            let rows = prepare::head(
+            let mut rows = self.control_rows.borrow_mut();
+            prepare::head_into(
                 effect.random_seed,
                 frame_num,
                 frame.width,
@@ -1311,6 +1839,7 @@ impl GpuBackend for WgpuBackend {
                 sx,
                 sy,
                 head,
+                &mut rows,
             );
             encoder.copy_buffer_to_buffer(&frame.y_buffer, 0, &frame.scratch_buffers[0], 0, size);
             self.dispatch_data(
@@ -1324,7 +1853,13 @@ impl GpuBackend for WgpuBackend {
         }
         if let Some(tracking) = &effect.tracking_noise {
             self.record_cpu_control("tracking_displacement_noise_and_snow");
-            let (rows, events) = prepare::tracking(
+            let mut rows = self.control_rows.borrow_mut();
+            let mut events = self.control_words.borrow_mut();
+            let mut shifts = self.control_floats.borrow_mut();
+            let mut snow = self.control_snow.borrow_mut();
+            let snow =
+                snow.get_or_insert_with(|| prepare::SnowScratch::new(frame.width, frame.height));
+            prepare::tracking_into_with_scratch(
                 effect.random_seed,
                 frame_num,
                 frame.width,
@@ -1332,6 +1867,10 @@ impl GpuBackend for WgpuBackend {
                 sx,
                 sy,
                 tracking,
+                &mut shifts,
+                snow,
+                &mut rows,
+                &mut events,
             );
             encoder.copy_buffer_to_buffer(&frame.y_buffer, 0, &frame.scratch_buffers[0], 0, size);
             self.dispatch_shared_data(
@@ -1382,12 +1921,7 @@ impl GpuBackend for WgpuBackend {
         }
         {
             self.record_dispatch("luma_into_chroma");
-            let pipeline = match demodulation {
-                ChromaDemodulationFilter::Box => &self.luma_into_chroma_box_pipeline,
-                ChromaDemodulationFilter::Notch => &self.luma_into_chroma_notch_pipeline,
-                ChromaDemodulationFilter::OneLineComb => &self.luma_into_chroma_one_line_pipeline,
-                ChromaDemodulationFilter::TwoLineComb => &self.luma_into_chroma_two_line_pipeline,
-            };
+            let pipeline = self.active_demodulation_pipeline(demodulation);
             let mut pass = encoder.begin_compute_pass(&self.pass_descriptor("luma_into_chroma"));
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, main_bind_group, &[]);
@@ -1412,7 +1946,8 @@ impl GpuBackend for WgpuBackend {
 
         if let Some(noise) = &effect.luma_noise {
             self.record_cpu_control("luma_noise_rows");
-            let rows = prepare::noise(
+            let mut rows = self.control_rows.borrow_mut();
+            prepare::noise_into(
                 effect.random_seed,
                 frame_num,
                 noise_seeds::VIDEO_LUMA,
@@ -1420,6 +1955,7 @@ impl GpuBackend for WgpuBackend {
                 frame.height,
                 sx,
                 noise,
+                &mut rows,
             );
             self.dispatch_data(
                 &mut encoder,
@@ -1440,7 +1976,8 @@ impl GpuBackend for WgpuBackend {
                 } else {
                     "chroma_q_noise_rows"
                 });
-                let rows = prepare::noise(
+                let mut rows = self.control_rows.borrow_mut();
+                prepare::noise_into(
                     effect.random_seed,
                     frame_num,
                     tag,
@@ -1448,6 +1985,7 @@ impl GpuBackend for WgpuBackend {
                     frame.height,
                     sx,
                     noise,
+                    &mut rows,
                 );
                 self.dispatch_data(
                     &mut encoder,
@@ -1473,11 +2011,13 @@ impl GpuBackend for WgpuBackend {
 
         if effect.chroma_phase_noise_intensity > 0.0 {
             self.record_cpu_control("chroma_phase_noise_rows");
-            let rows = prepare::phase(
+            let mut rows = self.control_rows.borrow_mut();
+            prepare::phase_into(
                 effect.random_seed,
                 frame_num,
                 frame.height,
                 effect.chroma_phase_noise_intensity,
+                &mut rows,
             );
             self.dispatch_data(
                 &mut encoder,
@@ -1510,7 +2050,18 @@ impl GpuBackend for WgpuBackend {
                 && wave.intensity > 0.0
             {
                 self.record_cpu_control("vhs_edge_wave_displacement");
-                let rows = prepare::wave(effect.random_seed, frame_num, frame.height, sx, sy, wave);
+                let mut rows = self.control_rows.borrow_mut();
+                let mut shifts = self.control_floats.borrow_mut();
+                prepare::wave_into_with_scratch(
+                    effect.random_seed,
+                    frame_num,
+                    frame.height,
+                    sx,
+                    sy,
+                    wave,
+                    &mut shifts,
+                    &mut rows,
+                );
                 for (plane, buffer) in [&frame.y_buffer, &frame.i_buffer, &frame.q_buffer]
                     .into_iter()
                     .enumerate()
@@ -1563,11 +2114,13 @@ impl GpuBackend for WgpuBackend {
 
             if vhs_settings.chroma_loss > 0.0 {
                 self.record_cpu_control("chroma_loss_rows");
-                let rows = prepare::loss(
+                let mut rows = self.control_rows.borrow_mut();
+                prepare::loss_into(
                     effect.random_seed,
                     frame_num,
                     frame.height,
                     vhs_settings.chroma_loss,
+                    &mut rows,
                 );
                 self.dispatch_data(
                     &mut encoder,
@@ -1622,6 +2175,49 @@ impl GpuBackend for WgpuBackend {
         }
         self.queue.submit(Some(encoder.finish()));
         self.submitted_effects += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn validate_wgsl(source: String) {
+        let module = naga::front::wgsl::parse_str(&source).expect("generated WGSL should parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .expect("generated WGSL should validate");
+    }
+
+    #[test]
+    fn fast_arithmetic_shader_sources_validate() {
+        validate_wgsl(format!(
+            "{}\n{}\n{}",
+            filter_shader_header(),
+            fast_filter_arithmetic_source(),
+            filter_shader_body()
+        ));
+        validate_wgsl(format!(
+            "{}\n{}",
+            fast_filter_arithmetic_source(),
+            include_str!("shaders/luma_into_chroma.wgsl")
+        ));
+    }
+
+    #[test]
+    fn filter_workgroup_variants_validate() {
+        for workgroup_size in [32, 64, 128, 256] {
+            validate_wgsl(filter_shader_for_workgroup(workgroup_size));
+            validate_wgsl(format!(
+                "{}\n{}\n{}",
+                filter_shader_header(),
+                fast_filter_arithmetic_source(),
+                filter_shader_body_for_workgroup(workgroup_size)
+            ));
+        }
     }
 }
 

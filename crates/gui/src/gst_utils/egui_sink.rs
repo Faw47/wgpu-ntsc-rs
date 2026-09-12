@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use std::sync::{Mutex, OnceLock};
 
 use super::ntscrs_filter::NtscFilterSettings;
-use super::process_gst_frame::process_gst_frame;
+use super::process_gst_frame::{process_gst_frame, process_gst_frame_rgbx_u8};
 
 #[derive(Clone, glib::Boxed, Default)]
 #[boxed_type(name = "SinkTexture")]
@@ -88,14 +88,25 @@ impl EguiSink {
         rect: Option<yiq_fielding::Rect>,
     ) -> Result<(), gstreamer::FlowError> {
         let out_stride = image.width() * 4;
-        process_gst_frame::<Rgbx, u8>(
-            &vframe.as_video_frame_ref(),
-            image.as_raw_mut(),
-            out_stride,
-            rect,
-            &self.settings.lock().unwrap().effect,
-            None,
-        )?;
+        let settings = self.settings.lock().unwrap();
+        if rect.is_none() {
+            process_gst_frame_rgbx_u8(
+                &vframe.as_video_frame_ref(),
+                image.as_raw_mut(),
+                out_stride,
+                &settings.effect,
+                None,
+            )?;
+        } else {
+            process_gst_frame::<Rgbx, u8>(
+                &vframe.as_video_frame_ref(),
+                image.as_raw_mut(),
+                out_stride,
+                rect,
+                &settings.effect,
+                None,
+            )?;
+        }
 
         Ok(())
     }

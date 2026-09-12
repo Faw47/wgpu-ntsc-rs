@@ -12,7 +12,12 @@ The previous benchmark labeled CPU work as GPU work, and the golden test compare
 | Fields | Render both interleaved fields with reference order, times, and row counts | Default settings run shaders and preserve odd-height behavior |
 | Dispatch | Two-dimensional dispatch for pixel shaders; row-count dispatch for recursive filters | Cover the whole image without launching a row operation per pixel |
 | Storage | Separate writable bindings; three-plane scratch; reuse frame and staging allocations | Remove aliasing and out-of-bounds copies |
-| Upload and readback | Reuse control buffers and filter bind groups; read back only Y/I/Q; enqueue both fields before waiting | Reduce allocation, transfer, and synchronization overhead |
+| Upload and readback | Reuse control buffers and filter bind groups; read back only Y/I/Q; batch both fields into one copy submission before waiting | Reduce allocation, transfer, and synchronization overhead |
+| Host conversion | Reuse a thread-local YIQ allocation in the GStreamer path and split host timing into input, backend, output, and total stages | Remove per-frame boxed allocations and expose non-GPU bottlenecks |
+| Preview output conversion | Add an opt-in adapter-side YIQ-to-packed-RGBA8 pass for progressive full-frame `Both` previews; reuse the existing scratch and staging buffers | Remove the CPU YIQ-to-RGB matrix and an extra output allocation without changing fielded or high-bit-depth paths |
+| Arithmetic modes | Keep strict host-specific rounding as the default; add an opt-in native-f32 filter/demodulation pipeline with WGSL validation | Permit measured throughput experiments without weakening the parity target |
+| Export precision | Negotiate 8-bit filter output for 8-bit H.264/FFV1/PNG exports and retain Argb64 for 10/12-bit codecs | Avoid unnecessary 16-bit post-effect writes and conversion bandwidth |
+| Control preparation | Reuse row, float, event, and sparse snow tile storage across frames | Reduce repeated CPU allocations while preserving the reference RNG sequence |
 | Filters | Reference coefficients and initial state; input filters, all demodulators, smear, ringing, composite/tape sharpening, tape lowpass | Preserve filter response and operation order |
 | Stochastic effects | Reference row/event random preparation; pixel shaders for noise, shifts, phase, loss, and snow | Preserve random sequence and appearance while moving image processing to compute |
 | Snow | Ordered transient lists binned into 32-pixel tiles | Parallel pixel evaluation without scanning all row events or floating-point atomics |
@@ -24,9 +29,11 @@ Recursive IIR filters remain sequential within a row. Replacing them with a shor
 
 ## Validation performed
 
-Rust 1.90.0, Linux, Mesa llvmpipe Vulkan (software adapter):
+Rust 1.90.0, Linux, in the current headless workspace:
 
-- 41 test functions passed with `cargo test -p ntsc-rs --features gpu-wgpu -- --include-ignored`, including required-adapter shader tests.
+- 48 core library tests passed with `cargo test -p ntsc-rs --features gpu-wgpu --lib`; the three adapter-backed tests remain ignored because this environment has no compute adapter.
+- The adapter-independent WGSL validation, adversarial compatibility tests, and block-control tests pass. Generated strict/fast arithmetic and 32/64/128/256 row-workgroup shader variants also parse and validate without an adapter.
+- The reusable YIQ conversion path is covered by a fresh-versus-reused allocation regression test, and the reusable stochastic control path retains the fixed-seed fingerprints.
 - Deterministic matrix exercises demodulation, filter families, delays, ringing, sharpening and tape speeds at tiny and irregular dimensions.
 - Stochastic matrix exercises isolated noise, snow, head switching, tracking, phase, and complete default presets with multiple seeds, frame numbers, scales, and dimensions.
 - CPU-only tests also passed. Core-library Clippy completed with no remaining warnings after fixes; two pre-existing warnings remain in the unrelated filter benchmark.
@@ -34,7 +41,7 @@ Rust 1.90.0, Linux, Mesa llvmpipe Vulkan (software adapter):
 - Field tests cover all five field modes, odd/even dimensions, buffer reuse/resizing, scale-with-video-size, and the application's cached selection path. The latter exposed a thread-local destructor ordering crash that was corrected.
 - The release benchmark completed progressive and interleaved default presets at 720x480, 1280x720, 1920x1080, and 3840x2160. Every size passed a finite-value and maximum absolute Y/I/Q error gate of 0.002 before measurement.
 
-The short software benchmark measured approximately 41 ms CPU versus 334 ms software-wgpu at progressive 4K, and 39 ms versus 336 ms at interleaved 4K. These are diagnostic software-adapter results, **not hardware GPU speedups**. Automatic selection rejects software adapters. Timing samples were short (10 samples, requested 0.3 s warmup and 0.5 s measurement); use Criterion defaults for hardware measurements.
+The earlier short software benchmark measured approximately 41 ms CPU versus 334 ms software-wgpu at progressive 4K, and 39 ms versus 336 ms at interleaved 4K. Those historical values are diagnostic software-adapter results, **not hardware GPU speedups**. Automatic selection rejects software adapters. The current changes have not been benchmarked on a physical RX 6800 in this environment; use Criterion defaults for hardware measurements.
 
 The reference is this fork's CPU code, with the noted short-row fix. Current upstream has changed RNG and other architecture; these tests do not prove bit identity with current upstream. Absolute float tolerance is a numerical gate, not exhaustive perceptual validation. Native Metal/DX12, real Vulkan GPUs, full applications and host plugins still need validation. This environment lacks the application GStreamer/GTK development dependencies and host SDK setup.
 
@@ -43,10 +50,10 @@ The reference is this fork's CPU code, with the noted short-row fix. Current ups
 These changes are not the only optimizations needed. Measure the following on the target hardware before claiming faster rendering:
 
 1. **Hardware acceptance gate.** Run the benchmark on representative discrete and integrated GPUs, record adapter/driver/CPU, and require full-preset GPU time below CPU time at the intended resolution. Repeat parity matrices on each driver. Small frames may remain faster on CPU; choose any crossover policy from measurements.
-2. **GPU-native preview.** RGB/YIQ conversion still runs on CPU, and preview currently returns pixels to CPU before uploading for display. Share a device with the preview renderer and retain intermediate/output images on GPU to remove those transfers. Compare rendered RGB images as well as YIQ.
-3. **Pipelined video export.** The synchronous caller still waits for output each frame. Field readbacks overlap submission, but this is not a multi-frame asynchronous export pipeline. A bounded queue and staging ring must preserve ordering, cancellation and backpressure while overlapping decoding, compute, readback and encoding.
+2. **GPU-native preview.** The opt-in `NTSC_WGPU_DIRECT_RGBA8=1` path now moves the YIQ-to-RGB8 matrix onto the adapter for tightly packed progressive `Both` previews and reuses the frame scratch/staging buffers. RGB-to-YIQ input conversion and the final CPU-to-egui upload still remain, and fielded, cropped, and high-bit-depth previews intentionally use the general path. Sharing a device with the eframe renderer and retaining the final image on GPU would remove those remaining transfers. Compare rendered RGB images as well as YIQ.
+3. **Pipelined video export.** The synchronous caller still waits for output each frame. Field readbacks overlap submission, and `WgpuBackend::apply_effect_async` is available to callers that own a bounded frame ring, but the desktop GStreamer transform remains synchronous. A full export pipeline must preserve ordering, cancellation and backpressure while overlapping decoding, compute, readback and encoding.
 4. **Profile recursive filters and memory traffic.** Use GPU timestamp queries and hardware profiling to identify dominant passes. Evaluate row layout, workgroup shape, safe pass fusion, and ping-pong scratch ownership. Preserve recurrence, edge conditions, and effect order; do not shorten filters to manufacture speedups.
-5. **Control preparation and cache pressure.** Reference random generation remains CPU work, including sparse snow amplitudes and row wave samples. Measure it separately before porting exact integer/RNG operations. Per-thread devices and caches can be expensive in hosts with many workers; investigate a bounded per-stream/device pool.
+5. **Control preparation and cache pressure.** Reference random generation remains CPU work, including sparse snow amplitudes and row wave samples. Common row, float, event, and snow-tile allocations are now reused, but the arithmetic itself is still CPU work. Measure it separately before porting exact integer/RNG operations. Per-thread devices and caches can be expensive in hosts with many workers; investigate a bounded per-stream/device pool.
 6. **Capacity and recovery.** Validate dense snow, extreme settings, oversized images, adapter storage limits, allocation failure and device loss. A 4K default benchmark is not a guarantee for every legal parameter combination or resolution. Add explicit limits and diagnostics before extending supported sizes.
 7. **Upstream and application acceptance.** Decide whether to adopt upstream's newer RNG as a deliberate compatibility change. Complete native application/plugin builds and visual comparisons on footage, gradients, text and saturated colors. The current numerical tests cannot prove every effect combination is perceptually unchanged.
 

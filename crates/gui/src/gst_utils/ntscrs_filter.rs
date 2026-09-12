@@ -5,10 +5,10 @@ use gstreamer::prelude::{GstParamSpecBuilderExt, ParamSpecBuilderExt, ToValue};
 use gstreamer_video::subclass::prelude::*;
 use gstreamer_video::{VideoFormat, VideoFrameExt};
 
-use ntsc_rs::yiq_fielding::{Bgrx, Rgbx, Xbgr, Xrgb};
+use ntsc_rs::yiq_fielding::{Bgrx, Xbgr, Xrgb};
 use ntsc_rs::{BackendPreference, NtscEffect};
 
-use super::process_gst_frame::process_gst_frame;
+use super::process_gst_frame::{process_gst_frame, process_gst_frame_rgbx_u8};
 
 #[derive(Clone, glib::Boxed, Default)]
 #[boxed_type(name = "NtscFilterSettings")]
@@ -160,11 +160,10 @@ impl VideoFilterImpl for NtscFilter {
 
         match out_format {
             VideoFormat::Rgbx | VideoFormat::Rgba => {
-                process_gst_frame::<Rgbx, u8>(
+                process_gst_frame_rgbx_u8(
                     in_frame,
                     out_data,
                     out_stride,
-                    None,
                     &settings.effect,
                     settings.backend_preference,
                 )?;

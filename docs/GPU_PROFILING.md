@@ -39,6 +39,42 @@ cargo run -p ntsc-rs --features gpu-wgpu \
 The output labels software adapters explicitly. Do not use those timings to
 decide whether the RX 6800 path is worthwhile.
 
+The strict shader path uses integer-emulated binary32 add and multiply-add
+rounding so that the GPU remains within the CPU parity target. For throughput
+experiments, set `NTSC_WGPU_FAST_MATH=1` before starting the process. This
+selects native adapter f32 arithmetic for recursive filters and demodulation.
+Fast math is intentionally not a bit-exact parity mode, and the default is
+unchanged when the variable is absent.
+
+The recursive row filter defaults to a 64-thread workgroup. Hardware tuning
+can select `NTSC_WGPU_FILTER_WORKGROUP=32`, `64`, `128`, or `256`; unsupported
+values or sizes beyond the adapter limit fall back to 64. This changes only
+dispatch shape, not filter arithmetic, and must be benchmarked on the target
+adapter.
+
+For the desktop preview path, `NTSC_GPU_PROFILE_HOST=1` logs the CPU input
+conversion, backend call, output conversion, and total time for each processed
+frame. This is useful for separating RGB/YIQ conversion and UI-side copies
+from WGPU work. The setting is sampled once per process and should be disabled
+for normal playback.
+
+The preview can also opt into adapter-side YIQ-to-RGBA8 conversion with
+`NTSC_WGPU_DIRECT_RGBA8=1`. This path is intentionally narrow: it applies only
+to progressive, tightly packed 8-bit previews using a full-frame `Both` field.
+Fielded, cropped, split-screen, and high-bit-depth output continue through the
+general CPU write path so their semantics do not change. If automatic backend
+selection cannot create WGPU, the preview retries through its normal CPU path.
+
+Library integrations that own their frame queue can use
+`WgpuBackend::apply_effect_async` to submit an effect and enqueue its readback
+without waiting. Keep a bounded number of frame slots, then finish pending
+readbacks in order. The desktop GStreamer transform remains synchronous, so it
+uses this capability only for batching the active interlaced fields today.
+
+For interactive playback, `NTSC_PREVIEW_LOW_LATENCY=1` makes the decoded video
+queue bounded and leaky downstream. That setting is deliberately opt-in and is
+not applied to render jobs, where dropping frames would be incorrect.
+
 ## Hardware benchmark
 
 On the target machine, first run the correctness gate and then the end-to-end

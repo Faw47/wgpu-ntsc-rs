@@ -478,6 +478,21 @@ impl NtscApp {
             }),
         )?;
 
+        if matches!(
+            std::env::var("NTSC_PREVIEW_LOW_LATENCY").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        ) && let Some(video_queue) = pipeline.inner.by_name("video_queue")
+        {
+            // Preview playback should drop stale decoded frames rather than
+            // building latency behind a synchronous effect transform. This is
+            // opt-in because render jobs use the same pipeline builder and must
+            // never silently drop output frames.
+            video_queue.set_property("max-size-buffers", 2u32);
+            video_queue.set_property("max-size-bytes", 0u32);
+            video_queue.set_property("max-size-time", 0u64);
+            video_queue.set_property_from_str("leaky", "downstream");
+        }
+
         pipeline.set_state(gstreamer::State::Paused)?;
 
         Ok(PipelineInfo {

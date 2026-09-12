@@ -201,8 +201,7 @@ fn real_device_loss_remains_visible_across_readbacks() {
 
     // Queue both readbacks before destroying the device so the test exercises
     // error handling after real submissions, not only the runner's preflight.
-    let first_pending = first_frame.enqueue_download();
-    let second_pending = second_frame.enqueue_download();
+    let [first_pending, second_pending] = backend.enqueue_downloads([&first_frame, &second_frame]);
     backend.device.destroy();
 
     let mut first_output = vec![0.0; YiqView::buf_length_for(dimensions, YiqField::Both)];

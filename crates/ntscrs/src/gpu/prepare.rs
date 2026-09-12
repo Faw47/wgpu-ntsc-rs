@@ -57,6 +57,7 @@ fn noise_row(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn noise(
     seed: i32,
     frame: usize,
@@ -66,9 +67,25 @@ pub fn noise(
     scale: f32,
     settings: &FbmNoiseSettings,
 ) -> Vec<Row> {
+    let mut result = Vec::new();
+    noise_into(seed, frame, tag, width, rows, scale, settings, &mut result);
+    result
+}
+
+pub fn noise_into(
+    seed: i32,
+    frame: usize,
+    tag: u64,
+    width: usize,
+    rows: usize,
+    scale: f32,
+    settings: &FbmNoiseSettings,
+    mut result: &mut Vec<Row>,
+) {
     let rng = stage_rng(seed, frame, tag);
     let lane_count = active_f32_lane_count();
-    let mut result = vec![Row::default(); rows];
+    result.clear();
+    result.resize(rows, Row::default());
     with_thread_pool(|| {
         ZipChunks::new([&mut result], 1).par_for_each(|row, [slot]| {
             slot[0] = noise_row(
@@ -82,12 +99,19 @@ pub fn noise(
             );
         });
     });
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn phase(seed: i32, frame: usize, rows: usize, intensity: f32) -> Vec<Row> {
+    let mut result = Vec::new();
+    phase_into(seed, frame, rows, intensity, &mut result);
     result
 }
 
-pub fn phase(seed: i32, frame: usize, rows: usize, intensity: f32) -> Vec<Row> {
+pub fn phase_into(seed: i32, frame: usize, rows: usize, intensity: f32, mut result: &mut Vec<Row>) {
     let rng = stage_rng(seed, frame, noise_seeds::VIDEO_CHROMA_PHASE);
-    let mut result = vec![Row::default(); rows];
+    result.clear();
+    result.resize(rows, Row::default());
     with_thread_pool(|| {
         ZipChunks::new([&mut result], 1).par_for_each(|row, [slot]| {
             let val = rng.clone().mix(row as u64).random::<f32>();
@@ -97,9 +121,9 @@ pub fn phase(seed: i32, frame: usize, rows: usize, intensity: f32) -> Vec<Row> {
             slot[0].frequency = cos;
         });
     });
-    result
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn head(
     seed: i32,
     frame: usize,
@@ -109,17 +133,33 @@ pub fn head(
     sy: f32,
     settings: &HeadSwitchingSettings,
 ) -> Vec<Row> {
-    let mut result = vec![
+    let mut result = Vec::new();
+    head_into(seed, frame, width, rows, sx, sy, settings, &mut result);
+    result
+}
+
+pub fn head_into(
+    seed: i32,
+    frame: usize,
+    width: usize,
+    rows: usize,
+    sx: f32,
+    sy: f32,
+    settings: &HeadSwitchingSettings,
+    result: &mut Vec<Row>,
+) {
+    result.clear();
+    result.resize(
+        rows,
         Row {
             start: width as u32,
             ..Row::default()
-        };
-        rows
-    ];
+        },
+    );
     let count = (settings.height.max(0) as f32 * sy).round() as usize;
     let offset = (settings.offset.max(0) as f32 * sy).round() as usize;
     if offset >= count {
-        return result;
+        return;
     }
     let affected = count - offset;
     let start = rows.saturating_sub(affected);
@@ -140,9 +180,9 @@ pub fn head(
             row.transient_intensity = (rng.random::<f32>() + 0.5) * 0.5;
         }
     }
-    result
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn wave(
     seed: i32,
     frame: usize,
@@ -151,6 +191,35 @@ pub fn wave(
     sy: f32,
     settings: &VHSEdgeWaveSettings,
 ) -> Vec<Row> {
+    let mut result = Vec::new();
+    wave_into(seed, frame, rows, sx, sy, settings, &mut result);
+    result
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn wave_into(
+    seed: i32,
+    frame: usize,
+    rows: usize,
+    sx: f32,
+    sy: f32,
+    settings: &VHSEdgeWaveSettings,
+    result: &mut Vec<Row>,
+) {
+    let mut shifts = Vec::new();
+    wave_into_with_scratch(seed, frame, rows, sx, sy, settings, &mut shifts, result);
+}
+
+pub fn wave_into_with_scratch(
+    seed: i32,
+    frame: usize,
+    rows: usize,
+    sx: f32,
+    sy: f32,
+    settings: &VHSEdgeWaveSettings,
+    shifts: &mut Vec<f32>,
+    result: &mut Vec<Row>,
+) {
     let mut rng = SplitMix64::new(seed as u32 as u64).mix(noise_seeds::EDGE_WAVE);
     let noise = Fbm {
         seed: rng.random::<i32>(),
@@ -160,26 +229,33 @@ pub fn wave(
         frequency: settings.frequency / sy,
     };
     let offset = rng.random::<f32>() * rows as f32;
-    let mut shifts = vec![0.0; rows];
+    shifts.clear();
+    shifts.resize(rows, 0.0);
     sample_noise_2d::<Simplex2d, _>(
         Level::new(),
         &noise,
         [offset, frame as f32 * settings.speed],
         [rows, 1],
-        &mut shifts,
+        shifts,
     );
-    shifts
-        .into_iter()
-        .map(|v| Row {
-            shift: (v / 0.022) * settings.intensity * 0.5 * sx,
-            extend: 1,
-            ..Row::default()
-        })
-        .collect()
+    result.clear();
+    result.extend(shifts.iter().copied().map(|v| Row {
+        shift: (v / 0.022) * settings.intensity * 0.5 * sx,
+        extend: 1,
+        ..Row::default()
+    }));
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn loss(seed: i32, frame: usize, rows: usize, intensity: f32) -> Vec<Row> {
-    let mut result = vec![Row::default(); rows];
+    let mut result = Vec::new();
+    loss_into(seed, frame, rows, intensity, &mut result);
+    result
+}
+
+pub fn loss_into(seed: i32, frame: usize, rows: usize, intensity: f32, result: &mut Vec<Row>) {
+    result.clear();
+    result.resize(rows, Row::default());
     let mut rng = stage_rng(seed, frame, noise_seeds::CHROMA_LOSS);
     let dist = geometric_lambda(intensity as f64);
     let mut row = 0usize;
@@ -191,9 +267,9 @@ pub fn loss(seed: i32, frame: usize, rows: usize, intensity: f32) -> Vec<Row> {
         result[row].loss = 1;
         row += 1;
     }
-    result
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn tracking(
     seed: i32,
     frame: usize,
@@ -203,6 +279,64 @@ pub fn tracking(
     sy: f32,
     settings: &TrackingNoiseSettings,
 ) -> (Vec<Row>, Vec<u32>) {
+    let mut result = Vec::new();
+    let mut snow = Vec::new();
+    tracking_into(
+        seed,
+        frame,
+        width,
+        rows,
+        sx,
+        sy,
+        settings,
+        &mut result,
+        &mut snow,
+    );
+    (result, snow)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn tracking_into(
+    seed: i32,
+    frame: usize,
+    width: usize,
+    rows: usize,
+    sx: f32,
+    sy: f32,
+    settings: &TrackingNoiseSettings,
+    result: &mut Vec<Row>,
+    events: &mut Vec<u32>,
+) {
+    let mut shifts = Vec::new();
+    let mut snow = SnowScratch::new(width, rows);
+    tracking_into_with_scratch(
+        seed,
+        frame,
+        width,
+        rows,
+        sx,
+        sy,
+        settings,
+        &mut shifts,
+        &mut snow,
+        result,
+        events,
+    );
+}
+
+pub fn tracking_into_with_scratch(
+    seed: i32,
+    frame: usize,
+    width: usize,
+    rows: usize,
+    sx: f32,
+    sy: f32,
+    settings: &TrackingNoiseSettings,
+    shifts: &mut Vec<f32>,
+    snow: &mut SnowScratch,
+    result: &mut Vec<Row>,
+    events: &mut Vec<u32>,
+) {
     let count = (settings.height.max(0) as f32 * sy).round() as usize;
     let start = rows.saturating_sub(count);
     let cutoff = count.saturating_sub(rows);
@@ -212,17 +346,19 @@ pub fn tracking(
         frequency: 0.5,
     };
     let offset = rng.random::<f32>() * rows as f32;
-    let mut shifts = vec![0.0; count.min(rows)];
-    sample_noise_1d::<Simplex1d, _>(Level::new(), &noise, [offset], [shifts.len()], &mut shifts);
-    let mut result = vec![
+    shifts.clear();
+    shifts.resize(count.min(rows), 0.0);
+    sample_noise_1d::<Simplex1d, _>(Level::new(), &noise, [offset], [shifts.len()], shifts);
+    result.clear();
+    result.resize(
+        rows,
         Row {
             start: width as u32,
             ..Row::default()
-        };
-        rows
-    ];
+        },
+    );
     let lane_count = active_f32_lane_count();
-    let mut snow = Snow::new(width, rows);
+    snow.0.reset(width, rows);
     for (local, row) in result[start..].iter_mut().enumerate() {
         let index = local + cutoff;
         let intensity = index as f32 / count as f32;
@@ -236,7 +372,7 @@ pub fn tracking(
             lane_count,
         );
         row.shift = shifts[local] * intensity * settings.wave_intensity * 0.25 * sx;
-        snow.row(
+        snow.0.row(
             start + local,
             rng.clone().mix(index as u64),
             settings.snow_intensity * intensity.powi(2),
@@ -244,7 +380,8 @@ pub fn tracking(
             sx,
         );
     }
-    (result, snow.finish())
+    events.clear();
+    snow.0.finish_into(events);
 }
 
 // Snow events are binned into 32-pixel tiles. Each pixel evaluates only overlapping
@@ -255,6 +392,17 @@ struct Snow {
     events: Vec<[u32; 4]>,
     random: Vec<u32>,
 }
+
+/// Reusable storage for sparse snow events. A backend can keep one instance per
+/// worker and avoid rebuilding the tile index and event vectors for every frame.
+pub struct SnowScratch(Snow);
+
+impl SnowScratch {
+    pub fn new(width: usize, rows: usize) -> Self {
+        Self(Snow::new(width, rows))
+    }
+}
+
 impl Snow {
     fn new(width: usize, rows: usize) -> Self {
         Self {
@@ -263,6 +411,18 @@ impl Snow {
             events: Vec::new(),
             random: Vec::new(),
         }
+    }
+
+    fn reset(&mut self, width: usize, rows: usize) {
+        let tile_count = width.div_ceil(32) * rows;
+        if self.width != width || self.tiles.len() != tile_count {
+            self.width = width;
+            self.tiles = vec![Vec::new(); tile_count];
+        } else {
+            self.tiles.iter_mut().for_each(Vec::clear);
+        }
+        self.events.clear();
+        self.random.clear();
     }
     fn row(
         &mut self,
@@ -317,26 +477,34 @@ impl Snow {
             start += 1;
         }
     }
-    fn finish(self) -> Vec<u32> {
+    fn finish_into(&self, words: &mut Vec<u32>) {
+        words.clear();
         if self.events.is_empty() {
-            return Vec::new();
+            return;
         }
-        let mut words = vec![0u32; 4 + self.tiles.len() + 1];
+        words.resize(4 + self.tiles.len() + 1, 0);
         for (tile, events) in self.tiles.iter().enumerate() {
             words[4 + tile] = words.len() as u32;
             words.extend_from_slice(events);
         }
         words[4 + self.tiles.len()] = words.len() as u32;
         words[0] = words.len() as u32;
-        for event in self.events {
-            words.extend_from_slice(&event);
+        for event in &self.events {
+            words.extend_from_slice(event);
         }
         words[1] = words.len() as u32;
-        words.extend(self.random);
+        words.extend_from_slice(&self.random);
+    }
+
+    #[allow(dead_code)]
+    fn finish(self) -> Vec<u32> {
+        let mut words = Vec::new();
+        self.finish_into(&mut words);
         words
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn snow(
     seed: i32,
     frame: usize,
@@ -346,10 +514,60 @@ pub fn snow(
     anisotropy: f32,
     scale: f32,
 ) -> Vec<u32> {
+    let mut result = Vec::new();
+    snow_into(
+        seed,
+        frame,
+        width,
+        rows,
+        intensity,
+        anisotropy,
+        scale,
+        &mut result,
+    );
+    result
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn snow_into(
+    seed: i32,
+    frame: usize,
+    width: usize,
+    rows: usize,
+    intensity: f32,
+    anisotropy: f32,
+    scale: f32,
+    result: &mut Vec<u32>,
+) {
+    let mut scratch = SnowScratch::new(width, rows);
+    snow_into_with_scratch(
+        seed,
+        frame,
+        width,
+        rows,
+        intensity,
+        anisotropy,
+        scale,
+        &mut scratch,
+        result,
+    );
+}
+
+pub fn snow_into_with_scratch(
+    seed: i32,
+    frame: usize,
+    width: usize,
+    rows: usize,
+    intensity: f32,
+    anisotropy: f32,
+    scale: f32,
+    scratch: &mut SnowScratch,
+    result: &mut Vec<u32>,
+) {
     let rng = stage_rng(seed, frame, noise_seeds::SNOW);
-    let mut result = Snow::new(width, rows);
+    scratch.0.reset(width, rows);
     for row in 0..rows {
-        result.row(
+        scratch.0.row(
             row,
             rng.clone().mix(row as u64),
             intensity,
@@ -357,7 +575,7 @@ pub fn snow(
             scale,
         );
     }
-    result.finish()
+    scratch.0.finish_into(result);
 }
 
 #[cfg(test)]

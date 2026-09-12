@@ -11,6 +11,7 @@ Semantic authority: upstream `88f2df9a27863097eaffd8d1fe0080a174dfd4a5`.
 4. Replace the standalone workspace layout: application command bar, dominant preview, right inspector with Effects/Presets/Export, searchable parameter groups, usable empty state and recent media, accessible transport and comparison controls, export queue and persistent error feedback. Preserve all settings, preset formats, media operations and codecs.
 5. Build and visually inspect the real desktop app at laptop and narrow window sizes; exercise media load, settings/search, comparison, presets, export and errors. Run the GPU acceptance tests.
 6. Merge verified code into main with no outstanding PR for this work. Record hardware and numerical limits honestly.
+7. Performance follow-up: batch interlaced readbacks, expose bounded asynchronous WGPU submission, reuse YIQ/control allocations, negotiate export precision, and add strict-versus-fast arithmetic plus filter-workgroup tuning knobs.
 
 ## Design contract
 
@@ -30,4 +31,4 @@ Database suggestions for landing pages, pink branding, GSAP and marketing statis
 
 Block-state propagation follows affine composition and boundary-state decomposition, as documented by the GPU recursive filtering literature linked at https://github.com/andmax/gpufilter. No claim from the unavailable July 2026 arXiv link is relied upon.
 A block computes its zero-state final state; a prefix propagation computes each block's incoming state; independent blocks replay from those states into a separate output. Coefficients, initial conditions, delay and edge extension are retained. Floating-point reassociation is explicitly an experimental numerical change.
-Physical RX 6800/Metal/DX12 performance and the decision to enable the experimental path are outside what a software Vulkan runner can establish. Full GPU residency and frame pipelining remain contingent on those measurements.
+The current implementation completes the safe host-side and submission-side follow-up: interlaced readback copies share one command buffer, `WgpuBackend::apply_effect_async` supports bounded callers, control and YIQ storage are reused, 8-bit exports avoid unnecessary Argb64 output, strict/fast arithmetic plus filter-workgroup variants are validated at the WGSL level, and an opt-in progressive `Both` preview can convert YIQ to packed RGBA8 on the adapter while reusing scratch/staging storage. Physical RX 6800/Metal/DX12 performance and the decision to enable the experimental block-IIR path are outside what a software Vulkan runner can establish. Full GPU residency in eframe and a multi-frame GStreamer export pipeline remain contingent on sharing the renderer device and changing the synchronous transform contract.

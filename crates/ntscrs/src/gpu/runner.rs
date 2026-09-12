@@ -351,8 +351,28 @@ impl NtscEffectRunner {
                         let (field_dispatches, field_controls) = backend.execution_evidence();
                         dispatched_stages.extend(field_dispatches);
                         cpu_control_stages.extend(field_controls);
-                        pending[slot] = Some(frame.enqueue_download());
                     }
+                }
+                match (first.is_some(), second.is_some()) {
+                    (true, true) => {
+                        let [first_pending, second_pending] = backend.enqueue_downloads([
+                            self.frames[0].as_ref().unwrap(),
+                            self.frames[1].as_ref().unwrap(),
+                        ]);
+                        pending[0] = Some(first_pending);
+                        pending[1] = Some(second_pending);
+                    }
+                    (true, false) => {
+                        let [first_pending] =
+                            backend.enqueue_downloads([self.frames[0].as_ref().unwrap()]);
+                        pending[0] = Some(first_pending);
+                    }
+                    (false, true) => {
+                        let [second_pending] =
+                            backend.enqueue_downloads([self.frames[1].as_ref().unwrap()]);
+                        pending[1] = Some(second_pending);
+                    }
+                    (false, false) => {}
                 }
                 let mut readback_error = None;
                 for (slot, view) in [(0, first.as_mut()), (1, second.as_mut())] {
@@ -388,5 +408,94 @@ impl NtscEffectRunner {
             #[cfg(not(feature = "gpu-wgpu"))]
             BackendType::Wgpu => unreachable!("unavailable WGPU must resolve to CPU"),
         }
+    }
+
+    /// Apply an effect and return packed RGBA8 pixels produced by the WGPU
+    /// adapter. This is an opt-in preview/export fast path for a full-frame
+    /// `Both` view. The normal YIQ API remains the compatibility path because
+    /// it supports every fielding mode, output format, crop, and deinterlacer.
+    #[cfg(feature = "gpu-wgpu")]
+    pub fn apply_effect_to_rgba8(
+        &mut self,
+        src: &YiqView,
+        effect: &NtscEffect,
+        frame_num: usize,
+        scale_factor: [f32; 2],
+        dst: &mut [u8],
+    ) -> Result<BackendExecution, BackendError> {
+        let unsupported = |message: &str| BackendError {
+            requested: self.requested_backend,
+            kind: BackendFailureKind::Unavailable,
+            message: message.to_owned(),
+        };
+        if src.field != YiqField::Both {
+            return Err(unsupported(
+                "direct RGBA8 output requires a full-frame Both YIQ view",
+            ));
+        }
+        let expected = src
+            .dimensions
+            .0
+            .checked_mul(src.num_rows())
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| unsupported("RGBA8 output size overflow"))?;
+        if dst.len() < expected {
+            return Err(unsupported("RGBA8 destination is smaller than the frame"));
+        }
+        if self.backend_type != BackendType::Wgpu {
+            return Err(unsupported(
+                "direct RGBA8 output requires an active WGPU backend",
+            ));
+        }
+
+        self.fallback_reason = None;
+        let backend = self.wgpu_backend.as_mut().unwrap();
+        if let Err(error) = backend.frame_capacity_requirements(src.dimensions.0, src.num_rows()) {
+            let error = classify_wgpu_error(self.requested_backend, error);
+            self.fallback_reason = Some(error.clone());
+            return Err(error);
+        }
+        let cpu_before = crate::ntsc::cpu_image_effect_invocations();
+        backend.begin_execution();
+        if let Some(message) = backend.current_device_loss() {
+            let error = classify_wgpu_error(
+                self.requested_backend,
+                crate::gpu::wgpu_backend::WgpuBackendError::DeviceLost(message),
+            );
+            self.fallback_reason = Some(error.clone());
+            return Err(error);
+        }
+        let frame = &mut self.frames[0];
+        if frame
+            .as_ref()
+            .is_none_or(|frame| (frame.width, frame.height) != (src.dimensions.0, src.num_rows()))
+        {
+            *frame = Some(backend.upload_frame(src));
+        } else {
+            backend.upload_into(src, frame.as_mut().unwrap());
+        }
+        let frame = frame.as_mut().unwrap();
+        backend.apply_effect(effect, frame, frame_num, scale_factor);
+        if let Some(error) = backend.take_pending_error() {
+            let error = classify_wgpu_error(self.requested_backend, error);
+            self.fallback_reason = Some(error.clone());
+            return Err(error);
+        }
+        let (dispatched_stages, cpu_control_stages) = backend.execution_evidence();
+        let [pending] = backend.enqueue_rgba8_downloads([&*frame]);
+        if let Err(error) = frame.try_finish_rgba8_download(dst, pending) {
+            let error = classify_wgpu_error(self.requested_backend, error);
+            self.fallback_reason = Some(error.clone());
+            return Err(error);
+        }
+        self.last_backend = BackendType::Wgpu;
+        Ok(BackendExecution {
+            requested: self.requested_backend,
+            actual: BackendType::Wgpu,
+            fallback_reason: None,
+            cpu_image_effect_invocations: crate::ntsc::cpu_image_effect_invocations() - cpu_before,
+            dispatched_stages,
+            cpu_control_stages,
+        })
     }
 }

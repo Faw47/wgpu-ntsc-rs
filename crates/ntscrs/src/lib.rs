@@ -46,6 +46,42 @@ impl FromStr for BackendPreference {
     }
 }
 
+#[cfg(feature = "gpu-wgpu")]
+fn make_wgpu_runner(preference: BackendPreference) -> gpu::runner::NtscEffectRunner {
+    let requested = if preference == BackendPreference::Auto {
+        gpu::BackendType::Auto
+    } else {
+        gpu::BackendType::Wgpu
+    };
+    gpu::runner::NtscEffectRunner::new(requested)
+}
+
+#[cfg(feature = "gpu-wgpu")]
+thread_local! {
+    static REQUESTED_WGPU_BACKEND: std::cell::Cell<BackendPreference> = const { std::cell::Cell::new(BackendPreference::Auto) };
+    // Construct wgpu before registering this TLS destructor. Its debug lock
+    // tracing also uses TLS and must remain alive while GPU resources drop.
+    static CACHED_WGPU_RUNNER: std::cell::RefCell<(BackendPreference, gpu::runner::NtscEffectRunner)> = {
+        let preference = REQUESTED_WGPU_BACKEND.get();
+        std::cell::RefCell::new((preference, make_wgpu_runner(preference)))
+    };
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn with_cached_wgpu_runner<R>(
+    preference: BackendPreference,
+    f: impl FnOnce(&mut gpu::runner::NtscEffectRunner) -> R,
+) -> R {
+    REQUESTED_WGPU_BACKEND.set(preference);
+    CACHED_WGPU_RUNNER.with(|runner| {
+        let mut cached = runner.borrow_mut();
+        if cached.0 != preference {
+            *cached = (preference, make_wgpu_runner(preference));
+        }
+        f(&mut cached.1)
+    })
+}
+
 pub fn apply_effect_to_yiq_with_backend_preference(
     effect: &NtscEffect,
     yiq: &mut YiqView,
@@ -60,30 +96,7 @@ pub fn apply_effect_to_yiq_with_backend_preference(
         backend_preference,
         BackendPreference::Auto | BackendPreference::Wgpu
     ) {
-        thread_local! {
-            static REQUESTED: std::cell::Cell<BackendPreference> = const { std::cell::Cell::new(BackendPreference::Auto) };
-            // Construct wgpu before registering this TLS destructor. Its debug lock
-            // tracing also uses TLS and must remain alive while GPU resources drop.
-            static RUNNER: std::cell::RefCell<(BackendPreference, gpu::runner::NtscEffectRunner)> = {
-                let preference = REQUESTED.get();
-                std::cell::RefCell::new((preference, make_runner(preference)))
-            };
-        }
-        fn make_runner(preference: BackendPreference) -> gpu::runner::NtscEffectRunner {
-            let requested = if preference == BackendPreference::Auto {
-                gpu::BackendType::Auto
-            } else {
-                gpu::BackendType::Wgpu
-            };
-            gpu::runner::NtscEffectRunner::new(requested)
-        }
-        REQUESTED.set(backend_preference);
-        return RUNNER.with(|runner| {
-            let mut cached = runner.borrow_mut();
-            if cached.0 != backend_preference {
-                *cached = (backend_preference, make_runner(backend_preference));
-            }
-            let (_, runner) = &mut *cached;
+        return with_cached_wgpu_runner(backend_preference, |runner| {
             runner.apply_effect(yiq, effect, frame_num, scale_factor)
         });
     }
@@ -94,4 +107,41 @@ pub fn apply_effect_to_yiq_with_backend_preference(
         BackendPreference::Cuda => gpu::BackendType::Cuda,
     };
     gpu::runner::NtscEffectRunner::new(requested).apply_effect(yiq, effect, frame_num, scale_factor)
+}
+
+/// Opt-in packed RGBA8 WGPU output for full-frame preview paths.
+///
+/// The standard YIQ entry point remains the compatibility API. This helper is
+/// intentionally limited to `YiqField::Both` because fielded output, crops,
+/// and high-bit-depth formats still require the normal CPU write path.
+#[cfg(feature = "gpu-wgpu")]
+pub fn apply_effect_to_rgba8_with_backend_preference(
+    effect: &NtscEffect,
+    yiq: &YiqView,
+    frame_num: usize,
+    scale_factor: [f32; 2],
+    backend_preference: BackendPreference,
+    dst: &mut [u8],
+) -> Result<gpu::BackendExecution, gpu::BackendError> {
+    if matches!(
+        backend_preference,
+        BackendPreference::Auto | BackendPreference::Wgpu
+    ) {
+        return with_cached_wgpu_runner(backend_preference, |runner| {
+            runner.apply_effect_to_rgba8(yiq, effect, frame_num, scale_factor, dst)
+        });
+    }
+    let requested = match backend_preference {
+        BackendPreference::Auto => gpu::BackendType::Auto,
+        BackendPreference::Cpu => gpu::BackendType::Cpu,
+        BackendPreference::Wgpu => gpu::BackendType::Wgpu,
+        BackendPreference::Cuda => gpu::BackendType::Cuda,
+    };
+    gpu::runner::NtscEffectRunner::new(requested).apply_effect_to_rgba8(
+        yiq,
+        effect,
+        frame_num,
+        scale_factor,
+        dst,
+    )
 }

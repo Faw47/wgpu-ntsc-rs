@@ -1048,6 +1048,48 @@ pub struct YiqOwned {
 }
 
 impl YiqOwned {
+    /// Allocate an owned YIQ frame for the requested logical dimensions and field.
+    pub fn new(dimensions: (usize, usize), field: YiqField) -> Self {
+        let data = vec![0f32; YiqView::buf_length_for(dimensions, field)].into_boxed_slice();
+        Self {
+            data,
+            dimensions,
+            field,
+        }
+    }
+
+    /// Reuse this allocation when possible and convert a strided pixel buffer into YIQ.
+    ///
+    /// Video preview paths process many frames with identical dimensions. Keeping the
+    /// backing allocation here avoids a boxed planar buffer allocation for every frame,
+    /// while retaining the same conversion and fielding behavior as the constructor.
+    pub fn set_from_strided_buffer<S: PixelFormat, T: Normalize>(
+        &mut self,
+        buf: &[T],
+        row_bytes: usize,
+        width: usize,
+        height: usize,
+        field: YiqField,
+    ) {
+        let dimensions = (width, height);
+        let required = YiqView::buf_length_for(dimensions, field);
+        if self.data.len() != required {
+            self.data = vec![0f32; required].into_boxed_slice();
+        }
+        self.dimensions = dimensions;
+        self.field = field;
+        let mut view = YiqView::from_parts(&mut self.data, dimensions, field);
+        view.set_from_strided_buffer::<S, T, _>(
+            buf,
+            BlitInfo::from_full_frame(width, height, row_bytes),
+            (),
+        );
+        // `from_strided_buffer` historically returned a zeroed scratch plane.
+        // Preserve that invariant when the backing allocation is reused across
+        // frames, since the CPU backend uses scratch as temporary state.
+        view.scratch.fill(0.0);
+    }
+
     pub fn from_strided_buffer<S: PixelFormat, T: Normalize>(
         buf: &[T],
         row_bytes: usize,
@@ -1055,20 +1097,9 @@ impl YiqOwned {
         height: usize,
         field: YiqField,
     ) -> Self {
-        let mut data = vec![0f32; YiqView::buf_length_for((width, height), field)];
-        let mut view = YiqView::from_parts(&mut data, (width, height), field);
-
-        view.set_from_strided_buffer::<S, T, _>(
-            buf,
-            BlitInfo::from_full_frame(width, height, row_bytes),
-            (),
-        );
-
-        YiqOwned {
-            data: data.into_boxed_slice(),
-            dimensions: (width, height),
-            field,
-        }
+        let mut owned = Self::new((width, height), field);
+        owned.set_from_strided_buffer::<S, T>(buf, row_bytes, width, height, field);
+        owned
     }
 }
 
@@ -1160,5 +1191,22 @@ mod tests {
             YiqView::max_buf_length_for((width, 4), UseField::Alternating),
             width * 2 * 4
         );
+    }
+
+    #[test]
+    fn reused_owned_conversion_matches_fresh_conversion() {
+        let pixels = [
+            0u8, 32, 128, 255, 64, 96, 192, 255, 255, 128, 16, 255, 12, 240, 80, 255,
+        ];
+        let mut reused = YiqOwned::new((2, 2), YiqField::Both);
+        reused.set_from_strided_buffer::<Rgbx, u8>(&pixels, 8, 2, 2, YiqField::Both);
+        let fresh = YiqOwned::from_strided_buffer::<Rgbx, u8>(&pixels, 8, 2, 2, YiqField::Both);
+        assert_eq!(reused.data, fresh.data);
+
+        let next_pixels = [255u8, 1, 2, 255, 3, 4, 5, 255, 6, 7, 8, 255, 9, 10, 11, 255];
+        reused.set_from_strided_buffer::<Rgbx, u8>(&next_pixels, 8, 2, 2, YiqField::Both);
+        let fresh =
+            YiqOwned::from_strided_buffer::<Rgbx, u8>(&next_pixels, 8, 2, 2, YiqField::Both);
+        assert_eq!(reused.data, fresh.data);
     }
 }

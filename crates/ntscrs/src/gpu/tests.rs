@@ -158,6 +158,55 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    #[ignore = "requires a compute adapter"]
+    fn direct_rgba8_output_matches_cpu_write_path() {
+        let width = 8;
+        let height = 8;
+        let mut pixels = vec![0.0f32; width * height * 4];
+        for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+            let value = (index % 19) as f32 / 19.0;
+            pixel[0] = value;
+            pixel[1] = value * 0.7;
+            pixel[2] = value * 0.4;
+            pixel[3] = 1.0;
+        }
+        let effect = NtscEffect::default();
+        let mut cpu = YiqOwned::from_strided_buffer::<Rgbx, f32>(
+            &pixels,
+            width * 4 * std::mem::size_of::<f32>(),
+            width,
+            height,
+            YiqField::Both,
+        );
+        let mut cpu_view = YiqView::from(&mut cpu);
+        effect.apply_effect_to_yiq(&mut cpu_view, 0, [1.0, 1.0]);
+        let mut expected = vec![0u8; width * height * 4];
+        cpu_view.write_to_strided_buffer::<Rgbx, u8, _>(
+            &mut expected,
+            crate::yiq_fielding::BlitInfo::from_full_frame(width, height, width * 4),
+            crate::yiq_fielding::DeinterlaceMode::Bob,
+            (),
+        );
+
+        let mut source = YiqOwned::from_strided_buffer::<Rgbx, f32>(
+            &pixels,
+            width * 4 * std::mem::size_of::<f32>(),
+            width,
+            height,
+            YiqField::Both,
+        );
+        let source_view = YiqView::from(&mut source);
+        let mut output = vec![0u8; expected.len()];
+        let mut runner = NtscEffectRunner::new(BackendType::Wgpu);
+        let execution = runner
+            .apply_effect_to_rgba8(&source_view, &effect, 0, [1.0, 1.0], &mut output)
+            .unwrap();
+        assert_eq!(execution.actual, BackendType::Wgpu);
+        assert_eq!(output, expected);
+    }
+
     #[test]
     #[ignore = "requires a compute adapter"]
     fn destroyed_explicit_wgpu_device_returns_an_error_without_cpu_processing() {

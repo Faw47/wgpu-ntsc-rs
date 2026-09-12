@@ -22,8 +22,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let height: usize = sizes.get(1).map(|s| s.parse()).transpose()?.unwrap_or(1080);
     let mut gpu = WgpuBackend::try_new()?;
     println!(
-        "Adapter: {} | {:?} | {:?}",
-        gpu.adapter_info.name, gpu.adapter_info.device_type, gpu.adapter_info.backend
+        "Adapter: {} | {:?} | {:?} | math={} | filter-workgroup={}",
+        gpu.adapter_info.name,
+        gpu.adapter_info.device_type,
+        gpu.adapter_info.backend,
+        if gpu.fast_math_enabled() {
+            "fast-native-f32"
+        } else {
+            "strict-parity"
+        },
+        gpu.filter_workgroup_size()
     );
     if gpu.adapter_info.device_type == wgpu::DeviceType::Cpu && !software {
         return Err("Software adapter refused. Use --allow-software only for correctness diagnostics, never hardware performance claims.".into());
@@ -53,19 +61,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     gpu.apply_effect(&effect, &mut frame, 7, [1.0, 1.0]);
     gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
     let profiling = gpu.set_profiling(true);
-    let start = Instant::now();
+    let total_start = Instant::now();
+    let upload_start = Instant::now();
     gpu.upload_into(&view, &mut frame);
+    let upload_ms = upload_start.elapsed().as_secs_f64() * 1000.0;
+    let effect_start = Instant::now();
     gpu.begin_execution();
     gpu.apply_effect(&effect, &mut frame, 7, [1.0, 1.0]);
     if let Some(e) = gpu.take_pending_error() {
         return Err(e.into());
     }
+    let effect_host_ms = effect_start.elapsed().as_secs_f64() * 1000.0;
+    let enqueue_start = Instant::now();
+    let pending = frame.enqueue_download();
+    let readback_enqueue_ms = enqueue_start.elapsed().as_secs_f64() * 1000.0;
     let mut actual = vec![0.0; data.len()];
+    let readback_wait_start = Instant::now();
     frame.try_finish_download(
         &mut YiqView::from_parts(&mut actual, (width, height), YiqField::Both),
-        frame.enqueue_download(),
+        pending,
     )?;
-    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    let readback_wait_ms = readback_wait_start.elapsed().as_secs_f64() * 1000.0;
+    let elapsed = total_start.elapsed().as_secs_f64() * 1000.0;
     let mut max = 0.0f32;
     for (a, b) in expected[..width * height * 3]
         .iter()
@@ -76,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     assert!(max <= 2e-3, "full effect parity failed: {max}");
     println!(
-        "{width}x{height} progressive, max error={max}; CPU={cpu_ms:.3} ms; WGPU host preparation + upload + effect + readback={elapsed:.3} ms"
+        "{width}x{height} progressive, max error={max}; CPU={cpu_ms:.3} ms; WGPU upload={upload_ms:.3} ms; effect host={effect_host_ms:.3} ms; readback enqueue={readback_enqueue_ms:.3} ms; readback wait/copy={readback_wait_ms:.3} ms; total={elapsed:.3} ms"
     );
     if profiling {
         let timings = gpu.read_pass_timings()?.unwrap();

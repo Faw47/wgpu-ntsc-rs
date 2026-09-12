@@ -64,6 +64,20 @@ fn every_live_wgsl_module_parses_and_validates_without_an_adapter() {
                 include_str!("../src/gpu/shaders/row_effects.wgsl")
             ),
         ),
+        ("YIQ to RGBA8 output", {
+            let filter = include_str!("../src/gpu/shaders/filter_plane.wgsl");
+            let start = filter
+                .find("// A four-word unsigned integer")
+                .expect("filter arithmetic start marker");
+            let end = filter
+                .find("@compute")
+                .expect("filter arithmetic end marker");
+            format!(
+                "{}\n{}",
+                &filter[start..end],
+                include_str!("../src/gpu/shaders/yiq_to_rgba8.wgsl")
+            )
+        }),
     ] {
         validate(label, &source);
     }

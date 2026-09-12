@@ -300,6 +300,20 @@ impl RenderJob {
                     .build()?;
                 elems.push(video_ntsc.clone());
 
+                // Keep the filter output at the codec's required precision. Most
+                // exports are 8-bit, so forcing every frame through Argb64 doubled
+                // the post-effect write bandwidth and the videoconvert input size.
+                // Preserve the 16-bit path for explicitly high-bit-depth exports.
+                let ntsc_output_format = match &settings_video_closure.codec_settings {
+                    RenderPipelineCodec::H264(settings) if settings.ten_bit => VideoFormat::Argb64,
+                    RenderPipelineCodec::Ffv1(settings)
+                        if !matches!(settings.bit_depth, Ffv1BitDepth::Bits8) =>
+                    {
+                        VideoFormat::Argb64
+                    }
+                    _ => VideoFormat::Rgbx,
+                };
+
                 // libx264 can't encode 4:2:0 subsampled videos with odd dimensions. Pad them out to even dimensions.
                 if let RenderPipelineCodec::H264(H264Settings {
                     chroma_subsampling: true,
@@ -315,7 +329,7 @@ impl RenderJob {
                     .property(
                         "caps",
                         gstreamer_video::VideoCapsBuilder::new()
-                            .format(gstreamer_video::VideoFormat::Argb64)
+                            .format(ntsc_output_format)
                             .build(),
                     )
                     .build()?;

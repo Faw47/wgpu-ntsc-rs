@@ -36,6 +36,31 @@ The benchmark includes control preparation, upload, compute, and readback, check
 
 See [the GPU audit](docs/gpu-audit.md) for implemented changes, validation limits, and remaining optimization work.
 
+Performance tuning is opt-in so the default remains the strict parity path:
+
+```sh
+# Native adapter f32 arithmetic for filter and demodulation experiments.
+NTSC_WGPU_FAST_MATH=1 cargo run -p ntsc-rs-gui --release
+
+# Try a different recursive-filter row workgroup on the target adapter.
+NTSC_WGPU_FILTER_WORKGROUP=128 cargo run -p ntsc-rs-gui --release
+
+# Keep interactive preview latency bounded by dropping stale decoded frames.
+NTSC_PREVIEW_LOW_LATENCY=1 cargo run -p ntsc-rs-gui --release
+
+# Convert full-frame progressive Both previews to RGBA8 on the adapter.
+NTSC_WGPU_DIRECT_RGBA8=1 cargo run -p ntsc-rs-gui --release
+```
+
+`NTSC_WGPU_FAST_MATH` is not a bit-exact mode and must be measured against the
+strict default. `NTSC_GPU_PROFILE_HOST=1` adds per-frame input conversion,
+backend, output conversion, and total timing to the desktop preview log.
+`NTSC_WGPU_DIRECT_RGBA8` is a narrow preview optimization for tightly packed
+progressive 8-bit `Both` frames; fielded, cropped, and high-bit-depth output
+keep the general path.
+8-bit exports now keep an 8-bit filter output; 10/12-bit H.264 and FFV1
+exports retain Argb64 processing.
+
 ## A Note on Development
 
 This fork has been developed with substantial language-model assistance. Its behavior and performance should be assessed from reproducible tests and measurements.
