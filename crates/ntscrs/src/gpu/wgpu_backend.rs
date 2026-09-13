@@ -315,6 +315,19 @@ fn exact_add_f32(a: f32, b: f32) -> f32 {
     return a + b;
 }
 
+fn exact_fma_f32(a: f32, b: f32, c: f32) -> f32 {
+    return fma(a, b, c);
+}
+
+fn upstream_mul_add(a: f32, b: f32, c: f32, fused: bool) -> f32 {
+    if (fused) {
+        return fma(a, b, c);
+    }
+    return a * b + c;
+}
+"#
+}
+
 fn block_filter_step(num: [f32; 4], den: [f32; 4], z: &mut [f32; 2], sample: f32) {
     let filtered = num[0] * sample + z[0];
     z[0] = num[1] * sample + z[1] - den[0] * filtered;
@@ -354,19 +367,6 @@ fn make_block_filter_params(
         initial_condition_mode: u32::from(first_sample),
         _pad: 0,
     })
-}
-
-fn exact_fma_f32(a: f32, b: f32, c: f32) -> f32 {
-    return fma(a, b, c);
-}
-
-fn upstream_mul_add(a: f32, b: f32, c: f32, fused: bool) -> f32 {
-    if (fused) {
-        return fma(a, b, c);
-    }
-    return a * b + c;
-}
-"#
 }
 
 impl GpuFrame for WgpuFrame {
