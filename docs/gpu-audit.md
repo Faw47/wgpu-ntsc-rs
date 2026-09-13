@@ -33,7 +33,7 @@ Rust 1.90.0, Linux, in the current headless workspace:
 
 - 48 core library tests passed with `cargo test -p ntsc-rs --features gpu-wgpu --lib`; the three adapter-backed tests remain ignored because this environment has no compute adapter.
 - The adapter-independent WGSL validation, adversarial compatibility tests, and block-control tests pass. Generated strict/fast arithmetic and 32/64/128/256 row-workgroup shader variants also parse and validate without an adapter.
-- The reusable YIQ conversion path is covered by a fresh-versus-reused allocation regression test, and the reusable stochastic control path retains the fixed-seed fingerprints.
+- The reusable YIQ conversion path is covered by a fresh-versus-reused allocation regression test. The reusable stochastic control path retains fixed-seed diagnostic fingerprints; the two SIMD-profile-dependent full-frame hashes are ignored in portable acceptance and skipped explicitly by the GPU CI command.
 - Deterministic matrix exercises demodulation, filter families, delays, ringing, sharpening and tape speeds at tiny and irregular dimensions.
 - Stochastic matrix exercises isolated noise, snow, head switching, tracking, phase, and complete default presets with multiple seeds, frame numbers, scales, and dimensions.
 - CPU-only tests also passed. Core-library Clippy completed with no remaining warnings after fixes; two pre-existing warnings remain in the unrelated filter benchmark.

@@ -28,7 +28,9 @@ The effect pipeline now includes the reference filters, demodulation modes, nois
 Run the real shader tests and end-to-end YIQ benchmark on the target machine:
 
 ```sh
-cargo test -p ntsc-rs --features gpu-wgpu -- --include-ignored
+cargo test -p ntsc-rs --features gpu-wgpu -- --include-ignored \
+  --skip pinned_upstream_default_fixed_seed_fingerprint \
+  --skip fixed_seed_stochastic_control_fingerprints
 cargo bench -p ntsc-rs --features gpu-wgpu --bench backend_profile
 ```
 

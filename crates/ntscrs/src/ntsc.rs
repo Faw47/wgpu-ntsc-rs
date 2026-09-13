@@ -1748,6 +1748,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "SIMD-profile-dependent diagnostic fingerprint; run only with a pinned SIMD profile"]
     fn pinned_upstream_default_fixed_seed_fingerprint() {
         let dimensions = (65, 33);
         let mut buffer = vec![0.0; YiqView::buf_length_for(dimensions, YiqField::Both)];

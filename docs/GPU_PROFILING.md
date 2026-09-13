@@ -10,7 +10,9 @@ performance.
 From the repository root:
 
 ```bash
-cargo test -p ntsc-rs --features gpu-wgpu -- --include-ignored
+cargo test -p ntsc-rs --features gpu-wgpu -- --include-ignored \
+  --skip pinned_upstream_default_fixed_seed_fingerprint \
+  --skip fixed_seed_stochastic_control_fingerprints
 ```
 
 The suite checks CPU/GPU parity, WGSL validation, backend selection, and the

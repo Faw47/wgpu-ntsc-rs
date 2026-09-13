@@ -181,7 +181,8 @@ jobs:
         submodules: recursive
 
     - name: Set deployment target
-      run: echo 'MACOSX_DEPLOYMENT_TARGET=10.12' >> $GITHUB_ENV
+      # GStreamer 1.28's official universal macOS installers support 10.13 and newer.
+      run: echo 'MACOSX_DEPLOYMENT_TARGET=10.13' >> $GITHUB_ENV
 
     - name: Add x86_64 target
       run: |
@@ -189,8 +190,25 @@ jobs:
 
     - name: Install packages
       run: |
-        brew install --cask gstreamer-runtime
-        brew install --cask gstreamer-development
+        set -euo pipefail
+        gst_version=1.28.7
+        gst_url="https://gstreamer.freedesktop.org/data/pkg/osx/${gst_version}"
+        temp_dir="$(mktemp -d)"
+        trap 'rm -rf "$temp_dir"' EXIT
+        curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+          --output "$temp_dir/gstreamer-runtime.pkg" \
+          "$gst_url/gstreamer-1.0-${gst_version}-universal.pkg"
+        curl --fail --silent --show-error --location --retry 3 --retry-all-errors \
+          --output "$temp_dir/gstreamer-development.pkg" \
+          "$gst_url/gstreamer-1.0-devel-${gst_version}-universal.pkg"
+        printf '%s  %s\n' \
+          529fdf4a4027d942e59b5b3564f6400adaa008f63ce5f3fed4ffe35d73911994 \
+          "$temp_dir/gstreamer-runtime.pkg" | shasum -a 256 -c -
+        printf '%s  %s\n' \
+          72a44870cf02472cbf6e9a84bcc25ee6807dd1c26659a112066373544d365e7a \
+          "$temp_dir/gstreamer-development.pkg" | shasum -a 256 -c -
+        sudo installer -pkg "$temp_dir/gstreamer-runtime.pkg" -target /
+        sudo installer -pkg "$temp_dir/gstreamer-development.pkg" -target /
 
     - name: Setup GStreamer devel
       run: |

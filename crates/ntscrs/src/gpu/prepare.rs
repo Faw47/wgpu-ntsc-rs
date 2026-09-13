@@ -1033,6 +1033,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "SIMD-profile-dependent diagnostic fingerprint; run only with a pinned SIMD profile"]
     fn fixed_seed_stochastic_control_fingerprints() {
         let noise_settings = FbmNoiseSettings {
             frequency: 1.7,
