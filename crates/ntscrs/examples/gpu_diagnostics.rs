@@ -98,7 +98,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     if profiling {
         let timings = gpu.read_pass_timings()?.unwrap();
-        assert_eq!(timings.len(), gpu.execution_evidence().0.len());
+        let evidence_count = gpu.execution_evidence().0.len();
+        if timings.len() != evidence_count {
+            eprintln!(
+                "timestamp/evidence count differs: {} timestamped passes, {} recorded dispatches",
+                timings.len(),
+                evidence_count
+            );
+        }
         for (i, t) in timings.iter().enumerate() {
             println!("{:02} {:32} {:10.4} ms", i + 1, t.stage, t.milliseconds);
         }
