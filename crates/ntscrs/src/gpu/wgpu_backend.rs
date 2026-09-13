@@ -1602,6 +1602,11 @@ impl WgpuBackend {
         self.block_filter_auto
     }
 
+    /// Whether the last encoded frame used the production block filter.
+    pub fn active_block_filter_enabled(&self) -> bool {
+        self.active_block_filter.get()
+    }
+
     fn block_filter_for_frame(&self, frame: &WgpuFrame) -> bool {
         if !self.block_filter {
             return false;
