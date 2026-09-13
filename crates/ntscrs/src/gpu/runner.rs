@@ -592,7 +592,7 @@ mod tests {
         assert!(!auto_allows_adapter(wgpu::DeviceType::IntegratedGpu, false));
         assert!(auto_allows_adapter(wgpu::DeviceType::IntegratedGpu, true));
         assert!(auto_allows_adapter(wgpu::DeviceType::DiscreteGpu, false));
-        assert!(auto_allows_adapter(wgpu::DeviceType::Virtual, false));
+        assert!(auto_allows_adapter(wgpu::DeviceType::VirtualGpu, false));
         assert!(auto_allows_adapter(wgpu::DeviceType::Other, false));
     }
 }
