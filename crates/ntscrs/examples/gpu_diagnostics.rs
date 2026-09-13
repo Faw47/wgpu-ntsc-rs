@@ -56,7 +56,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let mut expected = data.clone();
-    // This diagnostic uses a progressive frame (both fields in one view).\n    // Keep the effect field mode aligned so automatic block-filter selection\n    // exercises the progressive Metal path rather than the interlaced default.\n    let effect = NtscEffect {\n        use_field: UseField::Both,\n        ..NtscEffect::default()\n    };
+    // This diagnostic uses a progressive frame (both fields in one view).
+    // Keep the effect field mode aligned so automatic block-filter selection
+    // exercises the progressive Metal path rather than the interlaced default.
+    let effect = NtscEffect {
+        use_field: UseField::Both,
+        ..NtscEffect::default()
+    };
     let start = Instant::now();
     effect.apply_effect_to_yiq(
         &mut YiqView::from_parts(&mut expected, (width, height), YiqField::Both),
