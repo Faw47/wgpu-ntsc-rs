@@ -354,25 +354,6 @@ fn block_filter_transition(num: [f32; 4], den: [f32; 4]) -> [f32; 4] {
     [first[0], second[0], first[1], second[1]]
 }
 
-fn make_block_filter_params(
-    tf: &crate::filter::TransferFunction,
-    width: usize,
-    rows: usize,
-    delay: usize,
-    first_sample: bool,
-    plane_idx: u32,
-) -> Option<BlockFilterParams> {
-    make_block_filter_params_pair(
-        tf,
-        tf,
-        width,
-        rows,
-        delay,
-        delay,
-        first_sample,
-        plane_idx,
-    )
-}
 
 fn make_block_filter_params_pair(
     tf: &crate::filter::TransferFunction,
@@ -726,6 +707,7 @@ pub struct WgpuShared {
     simd_mul_add_fused: bool,
     fast_math: bool,
     block_filter: bool,
+    block_filter_auto: bool,
     filter_workgroup_size: u32,
     runtime_errors: Arc<std::sync::Mutex<Vec<String>>>,
     pub(crate) device_lost: Arc<std::sync::Mutex<Option<String>>>,
@@ -739,6 +721,7 @@ pub struct WgpuBackend {
     filter_cache: std::cell::RefCell<std::collections::HashMap<[u32; 16], wgpu::BindGroup>>,
     dispatch_stages: std::cell::RefCell<Vec<&'static str>>,
     cpu_control_stages: std::cell::RefCell<Vec<&'static str>>,
+    active_block_filter: std::cell::Cell<bool>,
     pending_error: std::cell::RefCell<Option<WgpuBackendError>>,
     last_control_preparation: std::cell::Cell<Duration>,
     last_host_timings: std::cell::Cell<WgpuHostTimings>,
@@ -960,6 +943,7 @@ impl WgpuBackend {
             filter_cache: Default::default(),
             dispatch_stages: Default::default(),
             cpu_control_stages: Default::default(),
+            active_block_filter: std::cell::Cell::new(false),
             pending_error: Default::default(),
             last_control_preparation: std::cell::Cell::new(Duration::ZERO),
             last_host_timings: std::cell::Cell::new(WgpuHostTimings::default()),
@@ -1045,11 +1029,20 @@ impl WgpuBackend {
             Ok("1") | Ok("true") | Ok("yes") => true,
             _ => !cfg!(debug_assertions),
         };
-        let block_filter = fast_math
-            && !matches!(
-                std::env::var("NTSC_WGPU_BLOCK_FILTER").as_deref(),
-                Ok("0") | Ok("false") | Ok("no")
-            );
+        // The block formulation is enabled by default in release builds. In
+        // automatic mode, integrated Metal GPUs use the simpler serial row
+        // kernel for progressive frames because the extra summarize/propagate/
+        // replay passes outweigh the parallelism at this shape. Set =1 to force
+        // the block path, or =0 to disable it.
+        let block_filter_env = std::env::var("NTSC_WGPU_BLOCK_FILTER").ok();
+        let block_filter_setting = match block_filter_env.as_deref() {
+            Some("0") | Some("false") | Some("no") => Some(false),
+            Some("1") | Some("true") | Some("yes") => Some(true),
+            Some("auto") | None => None,
+            Some(_) => None,
+        };
+        let block_filter = fast_math && block_filter_setting.unwrap_or(true);
+        let block_filter_auto = fast_math && block_filter_setting.is_none();
 
         let chroma_into_luma_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chroma_into_luma shader"),
@@ -1556,6 +1549,7 @@ impl WgpuBackend {
             simd_mul_add_fused,
             fast_math,
             block_filter,
+            block_filter_auto,
             filter_workgroup_size,
             runtime_errors,
             device_lost,
@@ -1600,6 +1594,28 @@ impl WgpuBackend {
 
     pub fn block_filter_enabled(&self) -> bool {
         self.block_filter
+    }
+
+    pub fn block_filter_auto_enabled(&self) -> bool {
+        self.block_filter_auto
+    }
+
+    fn block_filter_for_effect(&self, effect: &NtscEffect) -> bool {
+        if !self.block_filter {
+            return false;
+        }
+        if !self.block_filter_auto {
+            return true;
+        }
+
+        let progressive = !effect.use_field.interlaced_output_allowed();
+        !(progressive
+            && self.adapter_info.backend == wgpu::Backend::Metal
+            && self.adapter_info.device_type == wgpu::DeviceType::IntegratedGpu)
+    }
+
+    fn block_filter_enabled_for_frame(&self) -> bool {
+        self.active_block_filter.get()
     }
 
     pub fn filter_workgroup_size(&self) -> u32 {
@@ -1710,7 +1726,7 @@ impl WgpuBackend {
         delay: usize,
         plane_idx: u32,
     ) {
-        if self.block_filter
+        if self.block_filter_enabled_for_frame()
             && self.dispatch_block_filter(
                 encoder,
                 frame,
@@ -1865,7 +1881,6 @@ impl WgpuBackend {
             }],
         });
 
-        self.record_dispatch("filter_plane");
         let rows = frame.height as u32;
         let block_workgroups = params.blocks.div_ceil(64);
         for (pipeline, stage) in [
@@ -1873,6 +1888,7 @@ impl WgpuBackend {
             (&self.block_propagate_pipeline, "filter_block_propagate"),
             (&self.block_replay_pipeline, "filter_block_replay"),
         ] {
+            self.record_dispatch(stage);
             let mut pass = encoder.begin_compute_pass(&self.pass_descriptor(stage));
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &frame.main_bind_group, &[]);
@@ -1926,7 +1942,7 @@ impl WgpuBackend {
             );
             return;
         }
-        if self.block_filter
+        if self.block_filter_enabled_for_frame()
             && self.dispatch_block_filter(
                 encoder,
                 frame,
@@ -2070,7 +2086,7 @@ impl WgpuBackend {
                     make_lowpass_for_type(1_300_000.0, NTSC_RATE * scale, filter_type);
                 let q_filter =
                     make_lowpass_for_type(600_000.0, NTSC_RATE * scale, filter_type);
-                if self.block_filter
+                if self.block_filter_enabled_for_frame()
                     && self.dispatch_block_filter(
                         encoder,
                         frame,
@@ -2342,6 +2358,8 @@ impl WgpuBackend {
         self.data_index.set(0);
         self.dispatch_stages.borrow_mut().clear();
         self.cpu_control_stages.borrow_mut().clear();
+        self.active_block_filter
+            .set(self.block_filter_for_effect(effect));
         use super::prepare;
         let size = (frame.width * frame.height * std::mem::size_of::<f32>()) as u64;
         let mut ring_idx = 0;
