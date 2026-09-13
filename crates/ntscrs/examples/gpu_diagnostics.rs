@@ -3,6 +3,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use ntsc_rs::{
         NtscEffect,
+        settings::standard::UseField,
         gpu::{
             GpuBackend,
             block_filter::{BlockFilterExperiment, TransferFunction},
@@ -55,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let mut expected = data.clone();
-    let effect = NtscEffect::default();
+    // This diagnostic uses a progressive frame (both fields in one view).\n    // Keep the effect field mode aligned so automatic block-filter selection\n    // exercises the progressive Metal path rather than the interlaced default.\n    let effect = NtscEffect {\n        use_field: UseField::Both,\n        ..NtscEffect::default()\n    };
     let start = Instant::now();
     effect.apply_effect_to_yiq(
         &mut YiqView::from_parts(&mut expected, (width, height), YiqField::Both),
