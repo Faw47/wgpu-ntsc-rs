@@ -75,6 +75,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Warm pipelines before collecting a sample.
     gpu.apply_effect(&effect, &mut frame, 7, [1.0, 1.0]);
     gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
+    println!(
+        "Frame field=Both | active-block-filter={}",
+        gpu.active_block_filter_enabled()
+    );
     let profiling = gpu.set_profiling(true);
     let total_start = Instant::now();
     let upload_start = Instant::now();
