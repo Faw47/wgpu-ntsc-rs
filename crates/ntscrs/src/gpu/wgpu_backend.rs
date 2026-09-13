@@ -207,14 +207,22 @@ struct BlockFilterParams {
     den: [f32; 4],
     initial: [f32; 4],
     transition: [f32; 4],
+    num_q: [f32; 4],
+    den_q: [f32; 4],
+    initial_q: [f32; 4],
+    transition_q: [f32; 4],
     width: u32,
     rows: u32,
     blocks: u32,
     delay: u32,
+    delay_q: u32,
     plane_idx: u32,
     filter_len: u32,
     initial_condition_mode: u32,
-    _pad: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 
 #[repr(C)]
@@ -334,6 +342,16 @@ fn block_filter_step(num: [f32; 4], den: [f32; 4], z: &mut [f32; 2], sample: f32
     z[1] = num[2] * sample - den[1] * filtered;
 }
 
+fn block_filter_transition(num: [f32; 4], den: [f32; 4]) -> [f32; 4] {
+    let mut first = [1.0, 0.0];
+    let mut second = [0.0, 1.0];
+    for _ in 0..BLOCK_FILTER_SIZE {
+        block_filter_step(num, den, &mut first, 0.0);
+        block_filter_step(num, den, &mut second, 0.0);
+    }
+    [first[0], second[0], first[1], second[1]]
+}
+
 fn make_block_filter_params(
     tf: &crate::filter::TransferFunction,
     width: usize,
@@ -342,30 +360,64 @@ fn make_block_filter_params(
     first_sample: bool,
     plane_idx: u32,
 ) -> Option<BlockFilterParams> {
-    if !(2..=3).contains(&tf.len()) || width == 0 || rows == 0 || delay > BLOCK_FILTER_SIZE {
+    make_block_filter_params_pair(
+        tf,
+        tf,
+        width,
+        rows,
+        delay,
+        delay,
+        first_sample,
+        plane_idx,
+    )
+}
+
+fn make_block_filter_params_pair(
+    tf: &crate::filter::TransferFunction,
+    tf_q: &crate::filter::TransferFunction,
+    width: usize,
+    rows: usize,
+    delay: usize,
+    delay_q: usize,
+    first_sample: bool,
+    plane_idx: u32,
+) -> Option<BlockFilterParams> {
+    if !(2..=3).contains(&tf.len())
+        || tf.len() != tf_q.len()
+        || !(2..=3).contains(&tf_q.len())
+        || width == 0
+        || rows == 0
+        || delay > BLOCK_FILTER_SIZE
+        || delay_q > BLOCK_FILTER_SIZE
+    {
         return None;
     }
-    let blocks = width.checked_add(delay)?.div_ceil(BLOCK_FILTER_SIZE);
+    let blocks = width
+        .checked_add(delay.max(delay_q))?
+        .div_ceil(BLOCK_FILTER_SIZE);
     let (num, den, initial) = tf.to_gpu_coeffs(1.0);
-    let mut first = [1.0, 0.0];
-    let mut second = [0.0, 1.0];
-    for _ in 0..BLOCK_FILTER_SIZE {
-        block_filter_step(num, den, &mut first, 0.0);
-        block_filter_step(num, den, &mut second, 0.0);
-    }
+    let (num_q, den_q, initial_q) = tf_q.to_gpu_coeffs(1.0);
     Some(BlockFilterParams {
         num,
         den,
         initial,
-        transition: [first[0], second[0], first[1], second[1]],
+        transition: block_filter_transition(num, den),
+        num_q,
+        den_q,
+        initial_q,
+        transition_q: block_filter_transition(num_q, den_q),
         width: u32::try_from(width).ok()?,
         rows: u32::try_from(rows).ok()?,
         blocks: u32::try_from(blocks).ok()?,
         delay: u32::try_from(delay).ok()?,
+        delay_q: u32::try_from(delay_q).ok()?,
         plane_idx,
         filter_len: tf.len() as u32,
         initial_condition_mode: u32::from(first_sample),
-        _pad: 0,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+        _pad3: 0,
     })
 }
 
@@ -1657,7 +1709,16 @@ impl WgpuBackend {
         plane_idx: u32,
     ) {
         if self.block_filter
-            && self.dispatch_block_filter(encoder, frame, tf, first_sample, delay, plane_idx)
+            && self.dispatch_block_filter(
+                encoder,
+                frame,
+                tf,
+                None,
+                first_sample,
+                delay,
+                delay,
+                plane_idx,
+            )
         {
             return;
         }
@@ -1719,15 +1780,19 @@ impl WgpuBackend {
         encoder: &mut wgpu::CommandEncoder,
         frame: &WgpuFrame,
         tf: &crate::filter::TransferFunction,
+        tf_q: Option<&crate::filter::TransferFunction>,
         first_sample: bool,
         delay: usize,
+        delay_q: usize,
         plane_idx: u32,
     ) -> bool {
-        let Some(params) = make_block_filter_params(
+        let Some(params) = make_block_filter_params_pair(
             tf,
+            tf_q.unwrap_or(tf),
             frame.width,
             frame.height,
             delay,
+            delay_q,
             first_sample,
             plane_idx,
         ) else {
@@ -1860,7 +1925,16 @@ impl WgpuBackend {
             return;
         }
         if self.block_filter
-            && self.dispatch_block_filter(encoder, frame, tf, first_sample, delay, 3)
+            && self.dispatch_block_filter(
+                encoder,
+                frame,
+                tf,
+                None,
+                first_sample,
+                delay,
+                delay,
+                3,
+            )
         {
             return;
         }
@@ -1994,6 +2068,20 @@ impl WgpuBackend {
                     make_lowpass_for_type(1_300_000.0, NTSC_RATE * scale, filter_type);
                 let q_filter =
                     make_lowpass_for_type(600_000.0, NTSC_RATE * scale, filter_type);
+                if self.block_filter
+                    && self.dispatch_block_filter(
+                        encoder,
+                        frame,
+                        &i_filter,
+                        Some(&q_filter),
+                        false,
+                        2,
+                        4,
+                        3,
+                    )
+                {
+                    return;
+                }
                 self.dispatch_filter_plane(
                     encoder,
                     frame,
