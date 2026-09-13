@@ -1833,6 +1833,32 @@ impl WgpuBackend {
         first_sample: bool,
         delay: usize,
     ) {
+        // The strict arithmetic shader is also the portability oracle: keep
+        // its I and Q dispatches independent so every host-specific rounding
+        // boundary remains identical to the reference implementation. The
+        // production native-f32 path below can safely fuse the independent
+        // channels into one row dispatch.
+        if !self.fast_math {
+            self.dispatch_filter_plane(
+                encoder,
+                frame,
+                params_bind_group,
+                tf,
+                first_sample,
+                delay,
+                1,
+            );
+            self.dispatch_filter_plane(
+                encoder,
+                frame,
+                params_bind_group,
+                tf,
+                first_sample,
+                delay,
+                2,
+            );
+            return;
+        }
         if self.block_filter
             && self.dispatch_block_filter(encoder, frame, tf, first_sample, delay, 3)
         {
