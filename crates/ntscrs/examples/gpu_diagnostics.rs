@@ -85,15 +85,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     gpu.upload_into(&view, &mut frame);
     let upload_ms = upload_start.elapsed().as_secs_f64() * 1000.0;
     let effect_start = Instant::now();
-    gpu.begin_execution();
-    gpu.apply_effect(&effect, &mut frame, 7, [1.0, 1.0]);
-    if let Some(e) = gpu.take_pending_error() {
-        return Err(e.into());
-    }
-    let effect_host_ms = effect_start.elapsed().as_secs_f64() * 1000.0;
-    let enqueue_start = Instant::now();
-    let pending = frame.enqueue_download();
-    let readback_enqueue_ms = enqueue_start.elapsed().as_secs_f64() * 1000.0;
+    let pending = gpu.apply_effect_and_enqueue_download(
+        &effect,
+        &mut frame,
+        7,
+        [1.0, 1.0],
+    )?;
+    let effect_submit_ms = effect_start.elapsed().as_secs_f64() * 1000.0;
     let mut actual = vec![0.0; data.len()];
     let readback_wait_start = Instant::now();
     frame.try_finish_download(
@@ -112,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     assert!(max <= 2e-3, "full effect parity failed: {max}");
     println!(
-        "{width}x{height} progressive, max error={max}; CPU={cpu_ms:.3} ms; WGPU upload={upload_ms:.3} ms; effect host={effect_host_ms:.3} ms; readback enqueue={readback_enqueue_ms:.3} ms; readback wait/copy={readback_wait_ms:.3} ms; total={elapsed:.3} ms"
+        "{width}x{height} progressive, max error={max}; CPU={cpu_ms:.3} ms; WGPU upload={upload_ms:.3} ms; effect+readback submit={effect_submit_ms:.3} ms; readback wait/copy={readback_wait_ms:.3} ms; total={elapsed:.3} ms"
     );
     if profiling {
         let timings = gpu.read_pass_timings()?.unwrap();
