@@ -162,7 +162,7 @@ fn fma_test(@builtin(global_invocation_id) id: vec3<u32>) {{
         pass.dispatch_workgroups((cases.len() as u32).div_ceil(64), 1, 1);
     }
     encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, output_size);
-    backend.queue.submit(Some(encoder.finish()));
+    let submission_index = backend.queue.submit(Some(encoder.finish()));
 
     let slice = staging.slice(..);
     let (sender, receiver) = mpsc::channel();
@@ -171,7 +171,10 @@ fn fma_test(@builtin(global_invocation_id) id: vec3<u32>) {{
     });
     backend
         .device
-        .poll(wgpu::PollType::wait_indefinitely())
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(submission_index),
+            timeout: None,
+        })
         .unwrap();
     receiver.recv().unwrap().unwrap();
     let mapped = slice.get_mapped_range();
