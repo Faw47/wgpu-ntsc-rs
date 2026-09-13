@@ -773,6 +773,17 @@ impl WgpuBackend {
             .get_or_init(|| pollster::block_on(Self::init_shared()))
             .clone()?;
 
+        Self::from_shared(shared)
+    }
+
+    /// Construct a backend with a private device for destructive lifecycle tests.
+    #[doc(hidden)]
+    pub fn try_new_uncached() -> Result<Self, WgpuBackendError> {
+        let shared = pollster::block_on(Self::init_shared())?;
+        Self::from_shared(shared)
+    }
+
+    fn from_shared(shared: Arc<WgpuShared>) -> Result<Self, WgpuBackendError> {
         let params = ShaderParams {
             width: 0,
             frame_num: 0,

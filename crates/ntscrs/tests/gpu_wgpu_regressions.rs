@@ -191,7 +191,7 @@ fn fma_test(@builtin(global_invocation_id) id: vec3<u32>) {{
 #[test]
 #[ignore = "requires a compute adapter"]
 fn real_device_loss_remains_visible_across_readbacks() {
-    let mut backend = WgpuBackend::new().expect("adapter required");
+    let mut backend = WgpuBackend::try_new_uncached().expect("adapter required");
     eprintln!("ADAPTER {:?}", backend.adapter_info);
 
     let dimensions = (8, 8);
