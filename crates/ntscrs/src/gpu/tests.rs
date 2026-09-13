@@ -207,6 +207,19 @@ mod tests {
         assert_eq!(output, expected);
     }
 
+    #[cfg(feature = "gpu-wgpu")]
+    #[test]
+    #[ignore = "requires a compute adapter"]
+    fn wgpu_runners_share_immutable_context() {
+        let first =
+            crate::gpu::wgpu_backend::WgpuBackend::try_new().expect("compute adapter required");
+        let second =
+            crate::gpu::wgpu_backend::WgpuBackend::try_new().expect("compute adapter required");
+        assert!(first.shares_context_with(&second));
+        assert!(std::sync::Arc::ptr_eq(&first.device, &second.device));
+        assert!(std::sync::Arc::ptr_eq(&first.queue, &second.queue));
+    }
+
     #[test]
     #[ignore = "requires a compute adapter"]
     fn destroyed_explicit_wgpu_device_returns_an_error_without_cpu_processing() {

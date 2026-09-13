@@ -72,6 +72,18 @@ fn criterion_benchmark(c: &mut Criterion) {
                         "benchmark parity gate failed at {resolution}: {a} versus {b}"
                     );
                 }
+                eprintln!(
+                    "wgpu host stages {name}/{resolution}: control={:.3} ms, encode={:.3} ms, submit={:.3} ms",
+                    gpu.wgpu_last_host_timings()
+                        .map_or(0.0, |timings| timings.control_preparation.as_secs_f64()
+                            * 1_000.0),
+                    gpu.wgpu_last_host_timings()
+                        .map_or(0.0, |timings| timings.command_encoding.as_secs_f64()
+                            * 1_000.0),
+                    gpu.wgpu_last_host_timings()
+                        .map_or(0.0, |timings| timings.queue_submission.as_secs_f64()
+                            * 1_000.0),
+                );
             }
             group.bench_with_input(BenchmarkId::new("cpu", &resolution), &input, |b, input| {
                 b.iter_batched_ref(

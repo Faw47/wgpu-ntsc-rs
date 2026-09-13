@@ -170,6 +170,20 @@ impl NtscEffectRunner {
     }
 
     #[cfg(feature = "gpu-wgpu")]
+    pub fn wgpu_last_control_preparation_ms(&self) -> Option<f64> {
+        self.wgpu_backend
+            .as_ref()
+            .map(|backend| backend.last_control_preparation().as_secs_f64() * 1_000.0)
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
+    pub fn wgpu_last_host_timings(&self) -> Option<crate::gpu::wgpu_backend::WgpuHostTimings> {
+        self.wgpu_backend
+            .as_ref()
+            .map(crate::gpu::wgpu_backend::WgpuBackend::last_host_timings)
+    }
+
+    #[cfg(feature = "gpu-wgpu")]
     pub fn wgpu_limit_snapshot(&self) -> Option<(wgpu::Limits, wgpu::Limits, wgpu::Limits)> {
         self.wgpu_backend.as_ref().map(|backend| {
             (
@@ -186,12 +200,10 @@ impl NtscEffectRunner {
             .wgpu_backend
             .as_ref()
             .expect("test requires an active WGPU backend");
-        *backend
-            .device_lost
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some("test-injected device destruction".to_owned());
-        backend.device.destroy();
+        // The immutable WGPU context is process-shared. Inject the failure on
+        // this runner instead of destroying the shared device and poisoning
+        // unrelated adapter-backed tests.
+        backend.inject_device_loss_for_test();
     }
 
     pub fn apply_effect(
@@ -328,12 +340,13 @@ impl NtscEffectRunner {
                     self.fallback_reason = Some(error.clone());
                     return Err(error);
                 }
-                for (slot, view, number) in [
-                    (0, first.as_ref(), first_num),
-                    (1, second.as_ref(), second_num),
-                ] {
-                    if let Some(view) = view {
-                        let frame = &mut self.frames[slot];
+                if second.is_none() {
+                    // A progressive frame has one field. Encode the effect and
+                    // its readback copy together so it needs one queue
+                    // submission instead of separate compute and download
+                    // submissions.
+                    if let Some(view) = first.as_ref() {
+                        let frame = &mut self.frames[0];
                         if frame.as_ref().is_none_or(|frame| {
                             (frame.width, frame.height) != (view.dimensions.0, view.num_rows())
                         }) {
@@ -342,47 +355,89 @@ impl NtscEffectRunner {
                             backend.upload_into(view, frame.as_mut().unwrap());
                         }
                         let frame = frame.as_mut().unwrap();
-                        backend.apply_effect(effect, frame, number, scale_factor);
-                        if let Some(error) = backend.take_pending_error() {
-                            let error = classify_wgpu_error(self.requested_backend, error);
-                            self.fallback_reason = Some(error.clone());
-                            return Err(error);
-                        }
+                        pending[0] = Some(
+                            backend
+                                .apply_effect_and_enqueue_download(
+                                    effect,
+                                    frame,
+                                    first_num,
+                                    scale_factor,
+                                )
+                                .map_err(|error| {
+                                    let error = classify_wgpu_error(self.requested_backend, error);
+                                    self.fallback_reason = Some(error.clone());
+                                    error
+                                })?,
+                        );
                         let (field_dispatches, field_controls) = backend.execution_evidence();
                         dispatched_stages.extend(field_dispatches);
                         cpu_control_stages.extend(field_controls);
                     }
-                }
-                match (first.is_some(), second.is_some()) {
-                    (true, true) => {
-                        let [first_pending, second_pending] = backend.enqueue_downloads([
-                            self.frames[0].as_ref().unwrap(),
-                            self.frames[1].as_ref().unwrap(),
-                        ]);
-                        pending[0] = Some(first_pending);
-                        pending[1] = Some(second_pending);
+                } else {
+                    // Interlaced frames retain the existing two-field ordering
+                    // and one batched readback submission.
+                    for (slot, view, number) in [
+                        (0, first.as_ref(), first_num),
+                        (1, second.as_ref(), second_num),
+                    ] {
+                        if let Some(view) = view {
+                            let frame = &mut self.frames[slot];
+                            if frame.as_ref().is_none_or(|frame| {
+                                (frame.width, frame.height) != (view.dimensions.0, view.num_rows())
+                            }) {
+                                *frame = Some(backend.upload_frame(view));
+                            } else {
+                                backend.upload_into(view, frame.as_mut().unwrap());
+                            }
+                            let frame = frame.as_mut().unwrap();
+                            backend.apply_effect(effect, frame, number, scale_factor);
+                            if let Some(error) = backend.take_pending_error() {
+                                let error = classify_wgpu_error(self.requested_backend, error);
+                                self.fallback_reason = Some(error.clone());
+                                return Err(error);
+                            }
+                            let (field_dispatches, field_controls) = backend.execution_evidence();
+                            dispatched_stages.extend(field_dispatches);
+                            cpu_control_stages.extend(field_controls);
+                        }
                     }
-                    (true, false) => {
-                        let [first_pending] =
-                            backend.enqueue_downloads([self.frames[0].as_ref().unwrap()]);
-                        pending[0] = Some(first_pending);
+                    match (first.is_some(), second.is_some()) {
+                        (true, true) => {
+                            let [first_pending, second_pending] = backend.enqueue_downloads([
+                                self.frames[0].as_ref().unwrap(),
+                                self.frames[1].as_ref().unwrap(),
+                            ]);
+                            pending[0] = Some(first_pending);
+                            pending[1] = Some(second_pending);
+                        }
+                        (true, false) => {
+                            let [first_pending] =
+                                backend.enqueue_downloads([self.frames[0].as_ref().unwrap()]);
+                            pending[0] = Some(first_pending);
+                        }
+                        (false, true) => {
+                            let [second_pending] =
+                                backend.enqueue_downloads([self.frames[1].as_ref().unwrap()]);
+                            pending[1] = Some(second_pending);
+                        }
+                        (false, false) => {}
                     }
-                    (false, true) => {
-                        let [second_pending] =
-                            backend.enqueue_downloads([self.frames[1].as_ref().unwrap()]);
-                        pending[1] = Some(second_pending);
-                    }
-                    (false, false) => {}
                 }
                 let mut readback_error = None;
-                for (slot, view) in [(0, first.as_mut()), (1, second.as_mut())] {
-                    if let Some(view) = view {
-                        if let Err(error) = self.frames[slot]
-                            .as_ref()
-                            .unwrap()
-                            .try_finish_download(view, pending[slot].take().unwrap())
-                        {
-                            readback_error.get_or_insert(error);
+                if let Some(last_pending) = pending[1].as_ref().or(pending[0].as_ref()) {
+                    if let Err(error) = backend.wait_for_submitted_work(last_pending) {
+                        readback_error = Some(error);
+                    } else {
+                        for (slot, view) in [(0, first.as_mut()), (1, second.as_mut())] {
+                            if let Some(view) = view {
+                                if let Err(error) = self.frames[slot]
+                                    .as_ref()
+                                    .unwrap()
+                                    .finish_download_after_poll(view, pending[slot].take().unwrap())
+                                {
+                                    readback_error.get_or_insert(error);
+                                }
+                            }
                         }
                     }
                 }

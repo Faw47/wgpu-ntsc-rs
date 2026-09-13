@@ -90,6 +90,13 @@ is set. It covers progressive and interlaced frames at 480p, 720p, 1080p, and
 driver, resolution, and whether the run used the production row filter before
 making an architectural decision.
 
+The parity gate also prints WGPU host stages for each progressive and
+interlaced sample: independent control preparation, command encoding, and queue
+submission. The control streams use independent reference seeds and are
+prepared concurrently; the stage-level parity test keeps their generated data
+identical to the serial helpers. Use a physical adapter run to decide whether
+the extra host parallelism offsets its allocation cost on the target workload.
+
 ## Experimental block filter
 
 `gpu::block_filter` is isolated from normal rendering. It demonstrates

@@ -5,7 +5,11 @@ use crate::{
     yiq_fielding::YiqView,
 };
 
-use std::sync::Arc;
+use std::{
+    ops::Deref,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 use wgpu::util::DeviceExt;
 
 const IMAGE_STORAGE_BINDINGS: u32 = 6;
@@ -227,10 +231,18 @@ pub struct WgpuFrame {
 
 pub struct PendingReadback {
     receivers: [std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>; 3],
+    submission_index: wgpu::SubmissionIndex,
 }
 
 pub struct PendingRgba8Readback {
     receiver: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WgpuHostTimings {
+    pub control_preparation: Duration,
+    pub command_encoding: Duration,
+    pub queue_submission: Duration,
 }
 
 fn filter_arithmetic_source() -> &'static str {
@@ -341,7 +353,7 @@ impl WgpuFrame {
         );
     }
 
-    fn begin_download_mapping(&self) -> PendingReadback {
+    fn begin_download_mapping(&self, submission_index: wgpu::SubmissionIndex) -> PendingReadback {
         let receivers = std::array::from_fn(|plane| {
             let buffer_slice = self.staging_buffers[plane].slice(..);
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -351,7 +363,10 @@ impl WgpuFrame {
             receiver
         });
 
-        PendingReadback { receivers }
+        PendingReadback {
+            receivers,
+            submission_index,
+        }
     }
 
     fn rgba_output_size(&self) -> wgpu::BufferAddress {
@@ -378,8 +393,8 @@ impl WgpuFrame {
 
         self.record_download(&mut encoder);
 
-        self.queue.submit(Some(encoder.finish()));
-        self.begin_download_mapping()
+        let submission_index = self.queue.submit(Some(encoder.finish()));
+        self.begin_download_mapping(submission_index)
     }
 
     pub fn try_finish_download(
@@ -396,7 +411,10 @@ impl WgpuFrame {
                 self.height
             )));
         }
-        if let Err(error) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
+        if let Err(error) = self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(pending.submission_index.clone()),
+            timeout: None,
+        }) {
             self.staging_buffers.iter().for_each(wgpu::Buffer::unmap);
             if let Some(message) = self
                 .device_lost
@@ -407,6 +425,23 @@ impl WgpuFrame {
                 return Err(WgpuBackendError::DeviceLost(message));
             }
             return Err(WgpuBackendError::Runtime(error.to_string()));
+        }
+        self.finish_download_after_poll(dst, pending)
+    }
+
+    pub(crate) fn finish_download_after_poll(
+        &self,
+        dst: &mut YiqView,
+        pending: PendingReadback,
+    ) -> Result<(), WgpuBackendError> {
+        if (self.width, self.height) != (dst.dimensions.0, dst.num_rows()) {
+            return Err(WgpuBackendError::Readback(format!(
+                "destination is {}x{}, frame is {}x{}",
+                dst.dimensions.0,
+                dst.num_rows(),
+                self.width,
+                self.height
+            )));
         }
         let mut mapping_error = None;
         for receiver in pending.receivers {
@@ -531,10 +566,17 @@ impl WgpuFrame {
     }
 }
 
-pub struct WgpuBackend {
+/// Immutable device resources shared by every runner on the process.
+///
+/// A GStreamer pipeline can invoke the effect from more than one worker
+/// thread. Keeping this state in a process-wide `Arc` avoids recreating the
+/// adapter, device, shader modules, layouts, and pipelines for each worker;
+/// frame buffers and submission state remain private to each runner.
+pub struct WgpuShared {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     copy_bind_group_layout: wgpu::BindGroupLayout,
+    params_bind_group_layout: wgpu::BindGroupLayout,
     chroma_into_luma_pipeline: wgpu::ComputePipeline,
     luma_into_chroma_box_pipeline: wgpu::ComputePipeline,
     luma_into_chroma_notch_pipeline: wgpu::ComputePipeline,
@@ -553,16 +595,8 @@ pub struct WgpuBackend {
     filter_coeffs_bind_group_layout: wgpu::BindGroupLayout,
     rgba_output_bind_group_layout: wgpu::BindGroupLayout,
     rgba_output_pipeline: wgpu::ComputePipeline,
-    params_ring_buffer: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     row_layout: wgpu::BindGroupLayout,
     row_pipelines: std::collections::HashMap<&'static str, wgpu::ComputePipeline>,
-    control_rows: std::cell::RefCell<Vec<super::prepare::Row>>,
-    control_words: std::cell::RefCell<Vec<u32>>,
-    control_floats: std::cell::RefCell<Vec<f32>>,
-    control_snow: std::cell::RefCell<Option<super::prepare::SnowScratch>>,
-    data_cache: std::cell::RefCell<Vec<(wgpu::Buffer, wgpu::BindGroup, u64)>>,
-    data_index: std::cell::Cell<usize>,
-    filter_cache: std::cell::RefCell<std::collections::HashMap<[u32; 16], wgpu::BindGroup>>,
     pub adapter_info: wgpu::AdapterInfo,
     pub adapter_limits: wgpu::Limits,
     pub requested_limits: wgpu::Limits,
@@ -572,11 +606,31 @@ pub struct WgpuBackend {
     filter_workgroup_size: u32,
     runtime_errors: Arc<std::sync::Mutex<Vec<String>>>,
     pub(crate) device_lost: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+pub struct WgpuBackend {
+    shared: Arc<WgpuShared>,
+    params_ring_buffer: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    data_cache: std::cell::RefCell<Vec<(wgpu::Buffer, wgpu::BindGroup, u64)>>,
+    data_index: std::cell::Cell<usize>,
+    filter_cache: std::cell::RefCell<std::collections::HashMap<[u32; 16], wgpu::BindGroup>>,
     dispatch_stages: std::cell::RefCell<Vec<&'static str>>,
     cpu_control_stages: std::cell::RefCell<Vec<&'static str>>,
     pending_error: std::cell::RefCell<Option<WgpuBackendError>>,
+    last_control_preparation: std::cell::Cell<Duration>,
+    last_host_timings: std::cell::Cell<WgpuHostTimings>,
     submitted_effects: u64,
     profiler: Option<super::profiling::GpuProfiler>,
+    #[cfg(test)]
+    test_device_lost: std::cell::RefCell<Option<String>>,
+}
+
+impl Deref for WgpuBackend {
+    type Target = WgpuShared;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
 }
 
 impl WgpuBackend {
@@ -598,8 +652,8 @@ impl WgpuBackend {
         for frame in frames.iter() {
             frame.record_download(&mut encoder);
         }
-        self.queue.submit(Some(encoder.finish()));
-        frames.map(WgpuFrame::begin_download_mapping)
+        let submission_index = self.queue.submit(Some(encoder.finish()));
+        frames.map(|frame| frame.begin_download_mapping(submission_index.clone()))
     }
 
     /// Convert processed YIQ planes to packed RGBA8 on the adapter and submit
@@ -651,23 +705,148 @@ impl WgpuBackend {
         frame_num: usize,
         scale_factor: [f32; 2],
     ) -> Result<PendingReadback, WgpuBackendError> {
+        self.apply_effect_and_enqueue_download(effect, frame, frame_num, scale_factor)
+    }
+
+    /// Encode an effect and its YIQ readback into one command buffer.
+    ///
+    /// The normal interlaced path deliberately keeps its batched readback
+    /// submission so both fields can be submitted before either mapping is
+    /// waited on. Progressive frames have only one field, so combining the
+    /// effect and copy removes a queue submission without changing the
+    /// interlaced scheduling or readback semantics.
+    pub fn apply_effect_and_enqueue_download(
+        &mut self,
+        effect: &NtscEffect,
+        frame: &mut WgpuFrame,
+        frame_num: usize,
+        scale_factor: [f32; 2],
+    ) -> Result<PendingReadback, WgpuBackendError> {
         self.begin_execution();
-        GpuBackend::apply_effect(self, effect, frame, frame_num, scale_factor);
-        if let Some(error) = self.take_pending_error() {
-            return Err(error);
-        }
-        Ok(frame.enqueue_download())
+        let mut encoder = self
+            .encode_effect(effect, frame, frame_num, scale_factor)
+            .ok_or_else(|| {
+                self.take_pending_error().unwrap_or_else(|| {
+                    WgpuBackendError::Runtime(
+                        "WGPU effect encoding did not produce a command buffer".to_owned(),
+                    )
+                })
+            })?;
+        frame.record_download(&mut encoder);
+        let submit_started = Instant::now();
+        let submission_index = self.queue.submit(Some(encoder.finish()));
+        let mut timings = self.last_host_timings.get();
+        timings.queue_submission = submit_started.elapsed();
+        self.last_host_timings.set(timings);
+        self.submitted_effects += 1;
+        Ok(frame.begin_download_mapping(submission_index))
     }
 
     pub fn new() -> Option<Self> {
         Self::try_new().ok()
     }
 
-    pub fn try_new() -> Result<Self, WgpuBackendError> {
-        pollster::block_on(Self::init_async())
+    pub(crate) fn wait_for_submitted_work(
+        &self,
+        pending: &PendingReadback,
+    ) -> Result<(), WgpuBackendError> {
+        if let Err(error) = self.device.poll(wgpu::PollType::Wait {
+            submission_index: Some(pending.submission_index.clone()),
+            timeout: None,
+        }) {
+            if let Some(message) = self
+                .device_lost
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                return Err(WgpuBackendError::DeviceLost(message));
+            }
+            return Err(WgpuBackendError::Runtime(error.to_string()));
+        }
+        Ok(())
     }
 
-    async fn init_async() -> Result<Self, WgpuBackendError> {
+    pub fn try_new() -> Result<Self, WgpuBackendError> {
+        static SHARED: OnceLock<Result<Arc<WgpuShared>, WgpuBackendError>> = OnceLock::new();
+        let shared = SHARED
+            .get_or_init(|| pollster::block_on(Self::init_shared()))
+            .clone()?;
+
+        let params = ShaderParams {
+            width: 0,
+            frame_num: 0,
+            seed: 0,
+            noise_idx: 0,
+
+            noise_frequency: 0.0,
+            noise_intensity: 0.0,
+            noise_detail: 0,
+            snow_anisotropy: 0.0,
+
+            phase_shift: 0,
+            phase_offset: 0,
+            filter_mode: 0,
+            chroma_delay_horizontal: 0.0,
+
+            chroma_delay_vertical: 0,
+            horizontal_scale: 1.0,
+            vertical_scale: 1.0,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+            _pad4: 0,
+            _pad5: 0,
+        };
+        let mut params_ring_buffer = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let buffer = shared
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("shader params buffer"),
+                    contents: bytemuck::cast_slice(&[params]),
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                });
+            let bind_group = shared.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("params bind group"),
+                layout: &shared.params_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                }],
+            });
+            params_ring_buffer.push((buffer, bind_group));
+        }
+
+        Ok(Self {
+            shared,
+            params_ring_buffer,
+            data_cache: Default::default(),
+            data_index: Default::default(),
+            filter_cache: Default::default(),
+            dispatch_stages: Default::default(),
+            cpu_control_stages: Default::default(),
+            pending_error: Default::default(),
+            last_control_preparation: std::cell::Cell::new(Duration::ZERO),
+            last_host_timings: std::cell::Cell::new(WgpuHostTimings::default()),
+            submitted_effects: 0,
+            profiler: None,
+            #[cfg(test)]
+            test_device_lost: Default::default(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_context_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_device_loss_for_test(&self) {
+        *self.test_device_lost.borrow_mut() = Some("test-injected device loss".to_owned());
+    }
+
+    async fn init_shared() -> Result<Arc<WgpuShared>, WgpuBackendError> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
@@ -1122,57 +1301,11 @@ impl WgpuBackend {
                 cache: None,
             });
 
-        let params = ShaderParams {
-            width: 0,
-            frame_num: 0,
-            seed: 0,
-            noise_idx: 0,
-
-            noise_frequency: 0.0,
-            noise_intensity: 0.0,
-            noise_detail: 0,
-            snow_anisotropy: 0.0,
-
-            phase_shift: 0,
-            phase_offset: 0,
-            filter_mode: 0,
-            chroma_delay_horizontal: 0.0,
-
-            chroma_delay_vertical: 0,
-            horizontal_scale: 1.0,
-            vertical_scale: 1.0,
-            _pad1: 0,
-            _pad2: 0,
-            _pad3: 0,
-            _pad4: 0,
-            _pad5: 0,
-        };
-
-        let mut params_ring_buffer = Vec::new();
-        // One effect submission currently consumes at most four distinct
-        // parameter snapshots. Keep a small cushion without allocating a
-        // 32-slot ring that can never be used by this command graph.
-        for _ in 0..8 {
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("shader params buffer"),
-                contents: bytemuck::cast_slice(&[params]),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("params bind group"),
-                layout: &params_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffer.as_entire_binding(),
-                }],
-            });
-            params_ring_buffer.push((buffer, bind_group));
-        }
-
-        Ok(Self {
+        Ok(Arc::new(WgpuShared {
             device: Arc::new(device),
             queue: Arc::new(queue),
             copy_bind_group_layout,
+            params_bind_group_layout,
             chroma_into_luma_pipeline,
             luma_into_chroma_box_pipeline,
             luma_into_chroma_notch_pipeline,
@@ -1191,16 +1324,8 @@ impl WgpuBackend {
             filter_coeffs_bind_group_layout,
             rgba_output_bind_group_layout,
             rgba_output_pipeline,
-            params_ring_buffer,
             row_layout,
             row_pipelines,
-            control_rows: Default::default(),
-            control_words: Default::default(),
-            control_floats: Default::default(),
-            control_snow: Default::default(),
-            data_cache: Default::default(),
-            data_index: Default::default(),
-            filter_cache: Default::default(),
             adapter_info: adapter.get_info(),
             adapter_limits,
             requested_limits,
@@ -1210,12 +1335,7 @@ impl WgpuBackend {
             filter_workgroup_size,
             runtime_errors,
             device_lost,
-            dispatch_stages: Default::default(),
-            cpu_control_stages: Default::default(),
-            pending_error: Default::default(),
-            submitted_effects: 0,
-            profiler: None,
-        })
+        }))
     }
 
     /// Enable timestamps explicitly; unsupported devices remain usable without profiling.
@@ -1321,6 +1441,14 @@ impl WgpuBackend {
         )
     }
 
+    pub fn last_control_preparation(&self) -> Duration {
+        self.last_control_preparation.get()
+    }
+
+    pub fn last_host_timings(&self) -> WgpuHostTimings {
+        self.last_host_timings.get()
+    }
+
     pub fn begin_execution(&self) {
         self.runtime_errors
             .lock()
@@ -1330,6 +1458,10 @@ impl WgpuBackend {
     }
 
     pub fn current_device_loss(&self) -> Option<String> {
+        #[cfg(test)]
+        if let Some(message) = self.test_device_lost.borrow().clone() {
+            return Some(message);
+        }
         self.device_lost
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1674,6 +1806,25 @@ impl GpuBackend for WgpuBackend {
         frame_num: usize,
         scale_factor: [f32; 2],
     ) {
+        if let Some(encoder) = self.encode_effect(effect, frame, frame_num, scale_factor) {
+            let submit_started = Instant::now();
+            self.queue.submit(Some(encoder.finish()));
+            let mut timings = self.last_host_timings.get();
+            timings.queue_submission = submit_started.elapsed();
+            self.last_host_timings.set(timings);
+            self.submitted_effects += 1;
+        }
+    }
+}
+
+impl WgpuBackend {
+    fn encode_effect(
+        &mut self,
+        effect: &NtscEffect,
+        frame: &mut WgpuFrame,
+        frame_num: usize,
+        scale_factor: [f32; 2],
+    ) -> Option<wgpu::CommandEncoder> {
         if let Some(profiler) = &self.profiler {
             profiler.reset();
         }
@@ -1710,6 +1861,14 @@ impl GpuBackend for WgpuBackend {
             _pad4: 0,
             _pad5: 0,
         };
+
+        let sx = params.horizontal_scale;
+        let sy = params.vertical_scale;
+        let control_started = Instant::now();
+        let controls = prepare::controls(effect, frame_num, frame.width, frame.height, sx, sy);
+        let control_preparation = control_started.elapsed();
+        self.last_control_preparation.set(control_preparation);
+        let encoding_started = Instant::now();
 
         let mut encoder = self
             .device
@@ -1778,69 +1937,30 @@ impl GpuBackend for WgpuBackend {
             self.dispatch_filter_plane(&mut encoder, frame, base_params, &filter, false, 0, 0);
         }
 
-        let sx = params.horizontal_scale;
-        let sy = params.vertical_scale;
-        if let Some(noise) = &effect.composite_noise {
+        if let Some(rows) = controls.composite_noise.as_ref() {
             self.record_cpu_control("composite_noise_rows");
-            let mut rows = self.control_rows.borrow_mut();
-            prepare::noise_into(
-                effect.random_seed,
-                frame_num,
-                noise_seeds::VIDEO_COMPOSITE,
-                frame.width,
-                frame.height,
-                sx,
-                noise,
-                &mut rows,
-            );
             self.dispatch_data(
                 &mut encoder,
                 frame,
                 base_params,
                 main_bind_group,
                 "noise",
-                bytemuck::cast_slice(&rows),
+                bytemuck::cast_slice(rows),
             );
         }
-        if effect.snow_intensity > 0.0 && sx > 0.0 {
+        if let Some(events) = controls.snow.as_ref() {
             self.record_cpu_control("snow_events_and_values");
-            let mut events = self.control_words.borrow_mut();
-            let mut snow = self.control_snow.borrow_mut();
-            let snow =
-                snow.get_or_insert_with(|| prepare::SnowScratch::new(frame.width, frame.height));
-            prepare::snow_into_with_scratch(
-                effect.random_seed,
-                frame_num,
-                frame.width,
-                frame.height,
-                effect.snow_intensity * 0.01,
-                effect.snow_anisotropy,
-                sx,
-                snow,
-                &mut events,
-            );
             self.dispatch_data(
                 &mut encoder,
                 frame,
                 base_params,
                 main_bind_group,
                 "snow",
-                bytemuck::cast_slice(&events),
+                bytemuck::cast_slice(events),
             );
         }
-        if let Some(head) = &effect.head_switching {
+        if let Some(rows) = controls.head.as_ref() {
             self.record_cpu_control("head_switching_rows");
-            let mut rows = self.control_rows.borrow_mut();
-            prepare::head_into(
-                effect.random_seed,
-                frame_num,
-                frame.width,
-                frame.height,
-                sx,
-                sy,
-                head,
-                &mut rows,
-            );
             encoder.copy_buffer_to_buffer(&frame.y_buffer, 0, &frame.scratch_buffers[0], 0, size);
             self.dispatch_data(
                 &mut encoder,
@@ -1848,30 +1968,11 @@ impl GpuBackend for WgpuBackend {
                 base_params,
                 main_bind_group,
                 "shift_y",
-                bytemuck::cast_slice(&rows),
+                bytemuck::cast_slice(rows),
             );
         }
-        if let Some(tracking) = &effect.tracking_noise {
+        if let Some((rows, events)) = controls.tracking.as_ref() {
             self.record_cpu_control("tracking_displacement_noise_and_snow");
-            let mut rows = self.control_rows.borrow_mut();
-            let mut events = self.control_words.borrow_mut();
-            let mut shifts = self.control_floats.borrow_mut();
-            let mut snow = self.control_snow.borrow_mut();
-            let snow =
-                snow.get_or_insert_with(|| prepare::SnowScratch::new(frame.width, frame.height));
-            prepare::tracking_into_with_scratch(
-                effect.random_seed,
-                frame_num,
-                frame.width,
-                frame.height,
-                sx,
-                sy,
-                tracking,
-                &mut shifts,
-                snow,
-                &mut rows,
-                &mut events,
-            );
             encoder.copy_buffer_to_buffer(&frame.y_buffer, 0, &frame.scratch_buffers[0], 0, size);
             self.dispatch_shared_data(
                 &mut encoder,
@@ -1879,7 +1980,7 @@ impl GpuBackend for WgpuBackend {
                 base_params,
                 main_bind_group,
                 &["shift_y", "noise"],
-                bytemuck::cast_slice(&rows),
+                bytemuck::cast_slice(rows),
             );
             self.dispatch_data(
                 &mut encoder,
@@ -1887,7 +1988,7 @@ impl GpuBackend for WgpuBackend {
                 base_params,
                 main_bind_group,
                 "snow",
-                bytemuck::cast_slice(&events),
+                bytemuck::cast_slice(events),
             );
         }
 
@@ -1944,56 +2045,42 @@ impl GpuBackend for WgpuBackend {
             self.dispatch_filter_plane(&mut encoder, frame, demod_params, &filter, true, 1, 0);
         }
 
-        if let Some(noise) = &effect.luma_noise {
+        if let Some(rows) = controls.luma_noise.as_ref() {
             self.record_cpu_control("luma_noise_rows");
-            let mut rows = self.control_rows.borrow_mut();
-            prepare::noise_into(
-                effect.random_seed,
-                frame_num,
-                noise_seeds::VIDEO_LUMA,
-                frame.width,
-                frame.height,
-                sx,
-                noise,
-                &mut rows,
-            );
             self.dispatch_data(
                 &mut encoder,
                 frame,
                 base_params,
                 main_bind_group,
                 "noise",
-                bytemuck::cast_slice(&rows),
+                bytemuck::cast_slice(rows),
             );
         }
-        if let Some(noise) = &effect.chroma_noise {
-            for (tag, group) in [
-                (noise_seeds::VIDEO_CHROMA_I, &frame.i_pass_bind_group),
-                (noise_seeds::VIDEO_CHROMA_Q, &frame.q_pass_bind_group),
+        if let Some((i_rows, q_rows)) = controls.chroma_noise.as_ref() {
+            for (tag, rows, group) in [
+                (
+                    noise_seeds::VIDEO_CHROMA_I,
+                    i_rows,
+                    &frame.i_pass_bind_group,
+                ),
+                (
+                    noise_seeds::VIDEO_CHROMA_Q,
+                    q_rows,
+                    &frame.q_pass_bind_group,
+                ),
             ] {
                 self.record_cpu_control(if tag == noise_seeds::VIDEO_CHROMA_I {
                     "chroma_i_noise_rows"
                 } else {
                     "chroma_q_noise_rows"
                 });
-                let mut rows = self.control_rows.borrow_mut();
-                prepare::noise_into(
-                    effect.random_seed,
-                    frame_num,
-                    tag,
-                    frame.width,
-                    frame.height,
-                    sx,
-                    noise,
-                    &mut rows,
-                );
                 self.dispatch_data(
                     &mut encoder,
                     frame,
                     base_params,
                     group,
                     "noise",
-                    bytemuck::cast_slice(&rows),
+                    bytemuck::cast_slice(rows),
                 );
             }
         }
@@ -2009,23 +2096,15 @@ impl GpuBackend for WgpuBackend {
             pass.dispatch_workgroups(pixel_workgroups.0, pixel_workgroups.1, 1);
         }
 
-        if effect.chroma_phase_noise_intensity > 0.0 {
+        if let Some(rows) = controls.phase_noise.as_ref() {
             self.record_cpu_control("chroma_phase_noise_rows");
-            let mut rows = self.control_rows.borrow_mut();
-            prepare::phase_into(
-                effect.random_seed,
-                frame_num,
-                frame.height,
-                effect.chroma_phase_noise_intensity,
-                &mut rows,
-            );
             self.dispatch_data(
                 &mut encoder,
                 frame,
                 base_params,
                 main_bind_group,
                 "phase",
-                bytemuck::cast_slice(&rows),
+                bytemuck::cast_slice(rows),
             );
         }
 
@@ -2046,22 +2125,8 @@ impl GpuBackend for WgpuBackend {
         }
 
         if let Some(vhs_settings) = &effect.vhs_settings {
-            if let Some(wave) = &vhs_settings.edge_wave
-                && wave.intensity > 0.0
-            {
+            if let Some(rows) = controls.edge_wave.as_ref() {
                 self.record_cpu_control("vhs_edge_wave_displacement");
-                let mut rows = self.control_rows.borrow_mut();
-                let mut shifts = self.control_floats.borrow_mut();
-                prepare::wave_into_with_scratch(
-                    effect.random_seed,
-                    frame_num,
-                    frame.height,
-                    sx,
-                    sy,
-                    wave,
-                    &mut shifts,
-                    &mut rows,
-                );
                 for (plane, buffer) in [&frame.y_buffer, &frame.i_buffer, &frame.q_buffer]
                     .into_iter()
                     .enumerate()
@@ -2080,7 +2145,7 @@ impl GpuBackend for WgpuBackend {
                     base_params,
                     main_bind_group,
                     "shift_all",
-                    bytemuck::cast_slice(&rows),
+                    bytemuck::cast_slice(rows),
                 );
             }
 
@@ -2112,23 +2177,15 @@ impl GpuBackend for WgpuBackend {
                 );
             }
 
-            if vhs_settings.chroma_loss > 0.0 {
+            if let Some(rows) = controls.chroma_loss.as_ref() {
                 self.record_cpu_control("chroma_loss_rows");
-                let mut rows = self.control_rows.borrow_mut();
-                prepare::loss_into(
-                    effect.random_seed,
-                    frame_num,
-                    frame.height,
-                    vhs_settings.chroma_loss,
-                    &mut rows,
-                );
                 self.dispatch_data(
                     &mut encoder,
                     frame,
                     base_params,
                     main_bind_group,
                     "loss",
-                    bytemuck::cast_slice(&rows),
+                    bytemuck::cast_slice(rows),
                 );
             }
         }
@@ -2168,13 +2225,16 @@ impl GpuBackend for WgpuBackend {
         );
 
         if self.pending_error.borrow().is_some() {
-            return;
+            return None;
         }
         if let Some(profiler) = &self.profiler {
             profiler.resolve(&mut encoder);
         }
-        self.queue.submit(Some(encoder.finish()));
-        self.submitted_effects += 1;
+        let mut timings = self.last_host_timings.get();
+        timings.control_preparation = control_preparation;
+        timings.command_encoding = encoding_started.elapsed();
+        self.last_host_timings.set(timings);
+        Some(encoder)
     }
 }
 
