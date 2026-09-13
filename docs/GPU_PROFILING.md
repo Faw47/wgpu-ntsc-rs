@@ -54,12 +54,15 @@ values or sizes beyond the adapter limit fall back to 64. This changes only
 dispatch shape, not filter arithmetic, and must be benchmarked on the target
 adapter.
 
-Release fast math also enables the production affine block filter for supported
+Release fast math enables the production affine block filter for supported
 low-order filters (the default Butterworth path). It decomposes each row into
 64-sample blocks, propagates incoming states, and replays the blocks in
 parallel; identical or distinct I/Q filters can share the same three passes.
-Set `NTSC_WGPU_BLOCK_FILTER=0` to disable it for an A/B run. Debug builds keep
-the strict serial filter unless `NTSC_WGPU_FAST_MATH=1` is explicitly set.
+Automatic mode uses the block path on discrete GPUs and interlaced work. On
+integrated Metal GPUs it keeps the serial row kernel for progressive frames
+when that is faster. Set `NTSC_WGPU_BLOCK_FILTER=1` to force blocks, `=0` to
+disable them, or `=auto` for automatic selection. Debug builds keep the strict
+serial filter unless `NTSC_WGPU_FAST_MATH=1` is explicitly set.
 
 For the desktop preview path, `NTSC_GPU_PROFILE_HOST=1` logs the CPU input
 conversion, backend call, output conversion, and total time for each processed
