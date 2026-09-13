@@ -92,6 +92,13 @@ is set. It covers progressive and interlaced frames at 480p, 720p, 1080p, and
 driver, resolution, and whether the run used the production row filter before
 making an architectural decision.
 
+Automatic backend selection intentionally keeps the CPU reference on integrated
+adapters for this synchronous YIQ API. The measured frame includes upload,
+compute, readback, and mapping, so an integrated adapter can be slower than the
+multithreaded CPU path even when its compute dispatch is healthy. Set
+`NTSC_WGPU_AUTO_INTEGRATED=1` to test automatic WGPU selection on an integrated
+adapter, or request explicit WGPU when validating the adapter directly.
+
 The parity gate also prints WGPU host stages for each progressive and
 interlaced sample: independent control preparation, command encoding, and queue
 submission. The control streams use independent reference seeds and are

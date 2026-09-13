@@ -28,6 +28,27 @@ fn classify_wgpu_error(
     }
 }
 
+#[cfg(feature = "gpu-wgpu")]
+fn auto_allows_adapter(device_type: wgpu::DeviceType, allow_integrated: bool) -> bool {
+    match device_type {
+        // The current YIQ API uploads a frame and synchronously reads it back.
+        // On integrated adapters that transfer/scheduling cost can outweigh
+        // the compute work, so Auto keeps the CPU reference unless the user
+        // explicitly opts into an integrated WGPU path.
+        wgpu::DeviceType::Cpu => false,
+        wgpu::DeviceType::IntegratedGpu => allow_integrated,
+        _ => true,
+    }
+}
+
+#[cfg(feature = "gpu-wgpu")]
+fn allow_integrated_auto() -> bool {
+    matches!(
+        std::env::var("NTSC_WGPU_AUTO_INTEGRATED").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
 pub struct CpuBackend;
 
 pub struct CpuFrame<'a> {
@@ -83,9 +104,12 @@ impl NtscEffectRunner {
             BackendType::Wgpu | BackendType::Auto => {
                 match crate::gpu::wgpu_backend::WgpuBackend::try_new() {
                     Ok(backend) => {
-                        if requested_backend != BackendType::Auto
-                            || backend.adapter_info.device_type != wgpu::DeviceType::Cpu
-                        {
+                        let adapter_type = backend.adapter_info.device_type;
+                        let auto_allowed = auto_allows_adapter(
+                            adapter_type,
+                            allow_integrated_auto(),
+                        );
+                        if requested_backend != BackendType::Auto || auto_allowed {
                             eprintln!(
                                 "ntsc-rs: using GPU adapter {} ({:?})",
                                 backend.adapter_info.name, backend.adapter_info.backend
@@ -96,8 +120,11 @@ impl NtscEffectRunner {
                             fallback_reason = Some(BackendError {
                                 requested: requested_backend,
                                 kind: BackendFailureKind::Unavailable,
-                                message: "automatic selection rejected a CPU WGPU adapter"
-                                    .to_owned(),
+                                message: if adapter_type == wgpu::DeviceType::Cpu {
+                                    "automatic selection rejected a CPU WGPU adapter".to_owned()
+                                } else {
+                                    "automatic selection kept the CPU for an integrated WGPU adapter; set NTSC_WGPU_AUTO_INTEGRATED=1 to opt in".to_owned()
+                                },
                             });
                         }
                     }
@@ -552,5 +579,20 @@ impl NtscEffectRunner {
             dispatched_stages,
             cpu_control_stages,
         })
+    }
+}
+
+#[cfg(all(test, feature = "gpu-wgpu"))]
+mod tests {
+    use super::auto_allows_adapter;
+
+    #[test]
+    fn automatic_backend_rejects_cpu_and_integrated_without_opt_in() {
+        assert!(!auto_allows_adapter(wgpu::DeviceType::Cpu, false));
+        assert!(!auto_allows_adapter(wgpu::DeviceType::IntegratedGpu, false));
+        assert!(auto_allows_adapter(wgpu::DeviceType::IntegratedGpu, true));
+        assert!(auto_allows_adapter(wgpu::DeviceType::DiscreteGpu, false));
+        assert!(auto_allows_adapter(wgpu::DeviceType::Virtual, false));
+        assert!(auto_allows_adapter(wgpu::DeviceType::Other, false));
     }
 }
