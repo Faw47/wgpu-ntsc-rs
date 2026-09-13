@@ -156,10 +156,14 @@ The live path is `lib.rs::apply_effect_to_yiq_with_backend_preference` -> thread
 Device, pipelines, parameter buffers, filter bind groups, control-data buffers, frame buffers and staging buffers are persistent/reused. Each active field records the complete effect chain into one compute command buffer and submits once. Readback is a second submission. Interleaved fields use two independent `WgpuFrame` slots, enqueue both readbacks before the first blocking poll, and preserve the upstream doubled field timebase.
 
 Release WGPU execution uses native f32 arithmetic and enables the production
-64-sample affine block filter for supported low-order filters. The block pass
-summarizes zero-state blocks, propagates row boundaries, and replays samples in
-parallel; its paired mode supports both identical and distinct I/Q coefficients
-and delays. `NTSC_WGPU_FAST_MATH=0` selects the strict host-rounding path, while
+64-sample affine block filter for supported low-order filters. Automatic mode
+uses the block pass on discrete GPUs and interlaced work, while integrated
+Metal GPUs keep the serial row kernel for progressive frames when measured
+throughput is better. The block pass summarizes zero-state blocks, propagates
+row boundaries, and replays samples in parallel; its paired mode supports both
+identical and distinct I/Q coefficients and delays. Set
+`NTSC_WGPU_BLOCK_FILTER=1` to force blocks, `=0` to disable them, or `=auto`
+for automatic selection. `NTSC_WGPU_FAST_MATH=0` selects the strict host-rounding path, while
 `NTSC_WGPU_BLOCK_FILTER=0` disables block decomposition for controlled A/B
 measurements. Debug builds remain strict unless fast math is explicitly enabled.
 
