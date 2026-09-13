@@ -21,6 +21,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(1920);
     let height: usize = sizes.get(1).map(|s| s.parse()).transpose()?.unwrap_or(1080);
     let mut gpu = WgpuBackend::try_new()?;
+    let block_filter_mode = if !gpu.block_filter_enabled() {
+        "disabled"
+    } else if gpu.block_filter_auto_enabled() {
+        "auto"
+    } else {
+        "forced"
+    };
     println!(
         "Adapter: {} | {:?} | {:?} | math={} | block-filter={} | filter-workgroup={}",
         gpu.adapter_info.name,
@@ -31,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "strict-parity"
         },
-        gpu.block_filter_enabled(),
+        block_filter_mode,
         gpu.filter_workgroup_size()
     );
     if gpu.adapter_info.device_type == wgpu::DeviceType::Cpu && !software {
