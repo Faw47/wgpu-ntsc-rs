@@ -13,6 +13,7 @@ use std::{
 use wgpu::util::DeviceExt;
 
 const IMAGE_STORAGE_BINDINGS: u32 = 6;
+const BLOCK_FILTER_SIZE: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameCapacityRequirements {
@@ -201,6 +202,23 @@ pub struct FilterCoeffs {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct BlockFilterParams {
+    num: [f32; 4],
+    den: [f32; 4],
+    initial: [f32; 4],
+    transition: [f32; 4],
+    width: u32,
+    rows: u32,
+    blocks: u32,
+    delay: u32,
+    plane_idx: u32,
+    filter_len: u32,
+    initial_condition_mode: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct RgbaOutputParams {
     width: u32,
     _pad0: u32,
@@ -219,6 +237,10 @@ pub struct WgpuFrame {
     pub i_pass_bind_group: wgpu::BindGroup,
     pub q_pass_bind_group: wgpu::BindGroup,
     pub chroma_loss_bind_group: wgpu::BindGroup,
+    block_data_bind_group: Option<wgpu::BindGroup>,
+    block_summary: Option<wgpu::Buffer>,
+    block_boundaries: Option<wgpu::Buffer>,
+    block_capacity: u32,
     pub width: usize,
     pub height: usize,
     pub full_height: usize,
@@ -291,6 +313,47 @@ fn fast_filter_arithmetic_source() -> &'static str {
 // the default and is assembled from filter_plane.wgsl above.
 fn exact_add_f32(a: f32, b: f32) -> f32 {
     return a + b;
+}
+
+fn block_filter_step(num: [f32; 4], den: [f32; 4], z: &mut [f32; 2], sample: f32) {
+    let filtered = num[0] * sample + z[0];
+    z[0] = num[1] * sample + z[1] - den[0] * filtered;
+    z[1] = num[2] * sample - den[1] * filtered;
+}
+
+fn make_block_filter_params(
+    tf: &crate::filter::TransferFunction,
+    width: usize,
+    rows: usize,
+    delay: usize,
+    first_sample: bool,
+    plane_idx: u32,
+) -> Option<BlockFilterParams> {
+    if !(2..=3).contains(&tf.len()) || width == 0 || rows == 0 || delay > BLOCK_FILTER_SIZE {
+        return None;
+    }
+    let blocks = width.checked_add(delay)?.div_ceil(BLOCK_FILTER_SIZE);
+    let (num, den, initial) = tf.to_gpu_coeffs(1.0);
+    let mut first = [1.0, 0.0];
+    let mut second = [0.0, 1.0];
+    for _ in 0..BLOCK_FILTER_SIZE {
+        block_filter_step(num, den, &mut first, 0.0);
+        block_filter_step(num, den, &mut second, 0.0);
+    }
+    Some(BlockFilterParams {
+        num,
+        den,
+        initial,
+        transition: [first[0], second[0], first[1], second[1]],
+        width: u32::try_from(width).ok()?,
+        rows: u32::try_from(rows).ok()?,
+        blocks: u32::try_from(blocks).ok()?,
+        delay: u32::try_from(delay).ok()?,
+        plane_idx,
+        filter_len: tf.len() as u32,
+        initial_condition_mode: u32::from(first_sample),
+        _pad: 0,
+    })
 }
 
 fn exact_fma_f32(a: f32, b: f32, c: f32) -> f32 {
@@ -591,8 +654,13 @@ pub struct WgpuShared {
     chroma_delay_pipeline: wgpu::ComputePipeline,
     filter_plane_pipeline: wgpu::ComputePipeline,
     filter_plane_fast_pipeline: wgpu::ComputePipeline,
+    block_summarize_pipeline: wgpu::ComputePipeline,
+    block_propagate_pipeline: wgpu::ComputePipeline,
+    block_replay_pipeline: wgpu::ComputePipeline,
     chroma_vert_blend_pipeline: wgpu::ComputePipeline,
     filter_coeffs_bind_group_layout: wgpu::BindGroupLayout,
+    block_params_bind_group_layout: wgpu::BindGroupLayout,
+    block_data_bind_group_layout: wgpu::BindGroupLayout,
     rgba_output_bind_group_layout: wgpu::BindGroupLayout,
     rgba_output_pipeline: wgpu::ComputePipeline,
     row_layout: wgpu::BindGroupLayout,
@@ -603,6 +671,7 @@ pub struct WgpuShared {
     simd_lane_count: u32,
     simd_mul_add_fused: bool,
     fast_math: bool,
+    block_filter: bool,
     filter_workgroup_size: u32,
     runtime_errors: Arc<std::sync::Mutex<Vec<String>>>,
     pub(crate) device_lost: Arc<std::sync::Mutex<Option<String>>>,
@@ -913,10 +982,20 @@ impl WgpuBackend {
         });
 
         let (simd_lane_count, simd_mul_add_fused) = crate::filter::active_gpu_simd_profile();
-        let fast_math = matches!(
-            std::env::var("NTSC_WGPU_FAST_MATH").as_deref(),
-            Ok("1") | Ok("true") | Ok("yes")
-        );
+        // Release builds target throughput on the production GPU path. Debug
+        // builds retain strict arithmetic so parity and shader regressions are
+        // easy to diagnose. Set NTSC_WGPU_FAST_MATH=0 to force strict math in
+        // a release run, or =1 to exercise native f32 in a debug run.
+        let fast_math = match std::env::var("NTSC_WGPU_FAST_MATH").as_deref() {
+            Ok("0") | Ok("false") | Ok("no") => false,
+            Ok("1") | Ok("true") | Ok("yes") => true,
+            _ => !cfg!(debug_assertions),
+        };
+        let block_filter = fast_math
+            && !matches!(
+                std::env::var("NTSC_WGPU_BLOCK_FILTER").as_deref(),
+                Ok("0") | Ok("false") | Ok("no")
+            );
 
         let chroma_into_luma_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("chroma_into_luma shader"),
@@ -970,6 +1049,13 @@ impl WgpuBackend {
                     filter_shader_body_for_workgroup(filter_workgroup_size)
                 )
                 .into(),
+            ),
+        });
+
+        let block_filter_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("production block filter shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/block_filter_production.wgsl").into(),
             ),
         });
 
@@ -1096,6 +1182,48 @@ impl WgpuBackend {
                 ],
             });
 
+        let block_params_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("block filter params layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let block_data_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("block filter state layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
         let effect_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("effect pipeline layout"),
@@ -1110,6 +1238,17 @@ impl WgpuBackend {
                     &copy_bind_group_layout,
                     &params_bind_group_layout,
                     &filter_coeffs_bind_group_layout,
+                ],
+                push_constant_ranges: &[],
+            });
+
+        let block_filter_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("production block filter layout"),
+                bind_group_layouts: &[
+                    &copy_bind_group_layout,
+                    &block_params_bind_group_layout,
+                    &block_data_bind_group_layout,
                 ],
                 push_constant_ranges: &[],
             });
@@ -1286,6 +1425,20 @@ impl WgpuBackend {
                 cache: None,
             });
 
+        let block_pipeline = |entry: &'static str, label: &'static str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&block_filter_pipeline_layout),
+                module: &block_filter_shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        let block_summarize_pipeline = block_pipeline("summarize", "block filter summarize");
+        let block_propagate_pipeline = block_pipeline("propagate", "block filter propagate");
+        let block_replay_pipeline = block_pipeline("replay", "block filter replay");
+
         let chroma_vert_blend_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("chroma_vert_blend pipeline"),
@@ -1331,8 +1484,13 @@ impl WgpuBackend {
             chroma_delay_pipeline,
             filter_plane_pipeline,
             filter_plane_fast_pipeline,
+            block_summarize_pipeline,
+            block_propagate_pipeline,
+            block_replay_pipeline,
             chroma_vert_blend_pipeline,
             filter_coeffs_bind_group_layout,
+            block_params_bind_group_layout,
+            block_data_bind_group_layout,
             rgba_output_bind_group_layout,
             rgba_output_pipeline,
             row_layout,
@@ -1343,6 +1501,7 @@ impl WgpuBackend {
             simd_lane_count,
             simd_mul_add_fused,
             fast_math,
+            block_filter,
             filter_workgroup_size,
             runtime_errors,
             device_lost,
@@ -1383,6 +1542,10 @@ impl WgpuBackend {
 
     pub fn fast_math_enabled(&self) -> bool {
         self.fast_math
+    }
+
+    pub fn block_filter_enabled(&self) -> bool {
+        self.block_filter
     }
 
     pub fn filter_workgroup_size(&self) -> u32 {
@@ -1493,6 +1656,11 @@ impl WgpuBackend {
         delay: usize,
         plane_idx: u32,
     ) {
+        if self.block_filter
+            && self.dispatch_block_filter(encoder, frame, tf, first_sample, delay, plane_idx)
+        {
+            return;
+        }
         self.record_dispatch("filter_plane");
         let (num, den, z_initial) = tf.to_gpu_coeffs(if first_sample { 1.0 } else { 0.0 });
         let filter_coeffs = FilterCoeffs {
@@ -1544,6 +1712,141 @@ impl WgpuBackend {
 
         let rows = frame.height as u32;
         cpass.dispatch_workgroups(rows.div_ceil(self.filter_workgroup_size), 1, 1);
+    }
+
+    fn dispatch_block_filter(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &WgpuFrame,
+        tf: &crate::filter::TransferFunction,
+        first_sample: bool,
+        delay: usize,
+        plane_idx: u32,
+    ) -> bool {
+        let Some(params) = make_block_filter_params(
+            tf,
+            frame.width,
+            frame.height,
+            delay,
+            first_sample,
+            plane_idx,
+        ) else {
+            return false;
+        };
+        let Some(data_bind_group) = frame.block_data_bind_group.as_ref() else {
+            return false;
+        };
+        if params.blocks > frame.block_capacity {
+            return false;
+        }
+
+        let size = frame.download_size();
+        match plane_idx {
+            0 => encoder.copy_buffer_to_buffer(
+                &frame.y_buffer,
+                0,
+                &frame.scratch_buffers[0],
+                0,
+                size,
+            ),
+            1 => encoder.copy_buffer_to_buffer(
+                &frame.i_buffer,
+                0,
+                &frame.scratch_buffers[1],
+                0,
+                size,
+            ),
+            2 => encoder.copy_buffer_to_buffer(
+                &frame.q_buffer,
+                0,
+                &frame.scratch_buffers[2],
+                0,
+                size,
+            ),
+            3 => {
+                encoder.copy_buffer_to_buffer(
+                    &frame.i_buffer,
+                    0,
+                    &frame.scratch_buffers[1],
+                    0,
+                    size,
+                );
+                encoder.copy_buffer_to_buffer(
+                    &frame.q_buffer,
+                    0,
+                    &frame.scratch_buffers[2],
+                    0,
+                    size,
+                );
+            }
+            _ => return false,
+        }
+
+        let uniform = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("production block filter params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let params_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("production block filter params"),
+            layout: &self.block_params_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+
+        self.record_dispatch("filter_plane");
+        let rows = frame.height as u32;
+        let block_workgroups = params.blocks.div_ceil(64);
+        for (pipeline, stage) in [
+            (&self.block_summarize_pipeline, "filter_block_summarize"),
+            (&self.block_propagate_pipeline, "filter_block_propagate"),
+            (&self.block_replay_pipeline, "filter_block_replay"),
+        ] {
+            let mut pass = encoder.begin_compute_pass(&self.pass_descriptor(stage));
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &frame.main_bind_group, &[]);
+            pass.set_bind_group(1, &params_bind_group, &[]);
+            pass.set_bind_group(2, data_bind_group, &[]);
+            if stage == "filter_block_propagate" {
+                pass.dispatch_workgroups(rows.div_ceil(64), 1, 1);
+            } else {
+                pass.dispatch_workgroups(block_workgroups, rows, 1);
+            }
+        }
+        true
+    }
+
+    /// Run one transfer function over the two chroma planes together. This is
+    /// safe whenever I and Q use identical coefficients because their filter
+    /// states are independent. Keeping both states in one invocation removes a
+    /// full dispatch and avoids paying the row scheduling overhead twice.
+    fn dispatch_filter_planes<'a>(
+        &'a self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &WgpuFrame,
+        params_bind_group: &'a wgpu::BindGroup,
+        tf: &crate::filter::TransferFunction,
+        first_sample: bool,
+        delay: usize,
+    ) {
+        if self.block_filter
+            && self.dispatch_block_filter(encoder, frame, tf, first_sample, delay, 3)
+        {
+            return;
+        }
+        self.dispatch_filter_plane(
+            encoder,
+            frame,
+            params_bind_group,
+            tf,
+            first_sample,
+            delay,
+            3,
+        );
     }
 
     fn dispatch_data(
@@ -1646,16 +1949,15 @@ impl WgpuBackend {
             ChromaLowpass::Light => [(2_600_000.0, 1), (2_600_000.0, 1)],
             ChromaLowpass::Full => [(1_300_000.0, 2), (600_000.0, 4)],
         };
-        for (idx, (cutoff, delay)) in cuts.into_iter().enumerate() {
+        for (cutoff, delay) in cuts {
             let filter = make_lowpass_for_type(cutoff, NTSC_RATE * scale, filter_type);
-            self.dispatch_filter_plane(
+            self.dispatch_filter_planes(
                 encoder,
                 frame,
                 params,
                 &filter,
                 false,
                 delay,
-                idx as u32 + 1,
             );
         }
     }
@@ -1714,6 +2016,56 @@ impl GpuBackend for WgpuBackend {
                 mapped_at_creation: false,
             })
         });
+        let block_capacity = if self.block_filter {
+            src.dimensions
+                .0
+                .checked_add(BLOCK_FILTER_SIZE)
+                .map(|width| width.div_ceil(BLOCK_FILTER_SIZE))
+                .and_then(|blocks| u32::try_from(blocks).ok())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let block_state_bytes = u64::from(block_capacity)
+            .checked_mul(src.num_rows() as u64)
+            .and_then(|size| size.checked_mul(16));
+        let block_storage_supported = block_state_bytes.is_some_and(|bytes| {
+            bytes <= u64::from(self.device.limits().max_storage_buffer_binding_size)
+                && bytes <= self.device.limits().max_buffer_size
+        });
+        let (block_summary, block_boundaries, block_data_bind_group, block_capacity) =
+            if block_capacity != 0 && block_storage_supported {
+                let bytes = block_state_bytes.expect("checked block state size");
+                let summary = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("production block summaries"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+                let boundaries = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("production block boundaries"),
+                    size: bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("production block state"),
+                    layout: &self.block_data_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: summary.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: boundaries.as_entire_binding(),
+                        },
+                    ],
+                });
+                (Some(summary), Some(boundaries), Some(bind_group), block_capacity)
+            } else {
+                (None, None, None, 0)
+            };
         let staging_buffers = std::array::from_fn(|plane| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(["readback_y", "readback_i", "readback_q"][plane]),
@@ -1800,6 +2152,10 @@ impl GpuBackend for WgpuBackend {
             i_pass_bind_group,
             q_pass_bind_group,
             chroma_loss_bind_group,
+            block_data_bind_group,
+            block_summary,
+            block_boundaries,
+            block_capacity,
             width: src.dimensions.0,
             height: src.num_rows(),
             full_height: src.dimensions.1,
@@ -2166,17 +2522,14 @@ impl WgpuBackend {
                 let luma = make_lowpass_for_type(tape.luma_cut, rate, effect.filter_type);
                 let chroma = make_lowpass_for_type(tape.chroma_cut, rate, effect.filter_type);
                 self.dispatch_filter_plane(&mut encoder, frame, base_params, &luma, false, 0, 0);
-                for plane in 1..=2 {
-                    self.dispatch_filter_plane(
-                        &mut encoder,
-                        frame,
-                        base_params,
-                        &chroma,
-                        false,
-                        delay,
-                        plane,
-                    );
-                }
+                self.dispatch_filter_planes(
+                    &mut encoder,
+                    frame,
+                    base_params,
+                    &chroma,
+                    false,
+                    delay,
+                );
                 self.dispatch_filter_plane(
                     &mut encoder,
                     frame,

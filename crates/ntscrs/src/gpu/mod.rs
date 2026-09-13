@@ -21,9 +21,9 @@ pub enum BackendType {
     Wgpu,
     /// Reserved for the unimplemented CUDA backend.
     Cuda,
-    /// Automatically select the best available backend. Discrete WGPU adapters
-    /// are preferred; integrated adapters stay on CPU unless explicitly opted in
-    /// because this API synchronously uploads and reads back every frame.
+    /// Automatically select the best available backend. Any hardware WGPU
+    /// adapter is eligible; a CPU-only WGPU adapter is not treated as GPU
+    /// acceleration.
     Auto,
 }
 

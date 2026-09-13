@@ -19,7 +19,7 @@ This repository is derived from **[ntsc-rs](https://github.com/ntsc-rs/ntsc-rs)*
 
 ### GPU implementation and validation
 
-The `gpu-wgpu` feature enables Vulkan, Metal, or DX12 compute rendering and is enabled by default in the standalone application and plugin manifests. Automatic selection uses a discrete hardware adapter when available and otherwise uses the CPU reference. Integrated adapters stay on CPU by default because the compatibility API synchronously uploads and reads back every frame. Set `NTSC_WGPU_AUTO_INTEGRATED=1` to opt into automatic WGPU selection on an integrated adapter, or choose explicit `wgpu` for validation.
+The `gpu-wgpu` feature enables Vulkan, Metal, or DX12 compute rendering and is enabled by default in the standalone application and plugin manifests. Automatic selection uses any hardware WGPU adapter and rejects only software CPU adapters. Use explicit `wgpu` when you want a hard error instead of backend fallback.
 
 The effect pipeline now includes the reference filters, demodulation modes, noise, snow, head switching, tracking, VHS processing, and interleaved fields. GPU resources are reused across frames. Rust prepares reference random control data; compute shaders process the image planes.
 
@@ -38,10 +38,13 @@ The benchmark includes control preparation, upload, compute, and readback, check
 
 See [the GPU audit](docs/gpu-audit.md) for implemented changes, validation limits, and remaining optimization work.
 
-Performance tuning is opt-in so the default remains the strict parity path:
+Release builds use the native-f32 GPU path by default because it is the
+throughput path. Debug builds keep strict parity arithmetic for diagnostics.
+Set `NTSC_WGPU_FAST_MATH=0` to force strict arithmetic in a release build, or
+`=1` to enable native f32 in a debug build:
 
 ```sh
-# Native adapter f32 arithmetic for filter and demodulation experiments.
+# Force native adapter f32 arithmetic in a debug build.
 NTSC_WGPU_FAST_MATH=1 cargo run -p ntsc-rs-gui --release
 
 # Try a different recursive-filter row workgroup on the target adapter.
@@ -54,14 +57,12 @@ NTSC_PREVIEW_LOW_LATENCY=1 cargo run -p ntsc-rs-gui --release
 NTSC_WGPU_DIRECT_RGBA8=1 cargo run -p ntsc-rs-gui --release
 ```
 
-`NTSC_WGPU_FAST_MATH` is not a bit-exact mode and must be measured against the
-strict default. `NTSC_GPU_PROFILE_HOST=1` adds per-frame input conversion,
+`NTSC_WGPU_FAST_MATH` is not a bit-exact mode. `NTSC_GPU_PROFILE_HOST=1` adds per-frame input conversion,
 backend, output conversion, and total timing to the desktop preview log.
 `NTSC_WGPU_DIRECT_RGBA8` is a narrow preview optimization for tightly packed
 progressive 8-bit `Both` frames; fielded, cropped, and high-bit-depth output
 keep the general path.
-`NTSC_WGPU_AUTO_INTEGRATED=1` overrides automatic CPU selection on integrated
-adapters. Explicit `wgpu` selection is unaffected by this setting.
+Strict parity remains available with `NTSC_WGPU_FAST_MATH=0`.
 8-bit exports now keep an 8-bit filter output; 10/12-bit H.264 and FFV1
 exports retain Argb64 processing.
 

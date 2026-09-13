@@ -29,9 +29,9 @@ fn host_profile_enabled() -> bool {
 fn direct_rgba8_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        matches!(
+        !matches!(
             std::env::var("NTSC_WGPU_DIRECT_RGBA8").as_deref(),
-            Ok("1") | Ok("true") | Ok("yes")
+            Ok("0") | Ok("false") | Ok("no")
         )
     })
 }

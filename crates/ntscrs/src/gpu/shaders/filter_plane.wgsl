@@ -36,7 +36,7 @@ struct FilterCoeffs {
     z_initial: vec4<f32>,
     delay: u32,
     filter_len: u32,
-    plane_idx: u32, // 0: y, 1: i, 2: q
+    plane_idx: u32, // 0: y, 1: i, 2: q, 3: i and q together
     // Bit 0: FirstSample initial condition. Bit 1: fused host SIMD arithmetic.
     initial_condition_mode: u32,
 }
@@ -381,6 +381,53 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let filter_len = filter_coeffs.filter_len;
     let delay = filter_coeffs.delay;
     let plane_idx = filter_coeffs.plane_idx;
+
+    // Chroma low-pass and VHS tape filters use the same transfer function for
+    // I and Q. Process both planes in one row invocation so the scheduler sees
+    // half as many dependent filter dispatches. The two state machines remain
+    // independent, so this preserves the scalar filter's numerical ordering.
+    if (plane_idx == 3u) {
+        var zi = filter_coeffs.z_initial;
+        var zq = filter_coeffs.z_initial;
+        if ((filter_coeffs.initial_condition_mode & 1u) != 0u) {
+            zi *= i_plane[row_start];
+            zq *= q_plane[row_start];
+        }
+        let fused = (filter_coeffs.initial_condition_mode & 2u) != 0u;
+        for (var i = 0u; i < width + delay; i++) {
+            let read_idx = row_start + min(i, width - 1u);
+            let i_sample = i_plane[read_idx];
+            let q_sample = q_plane[read_idx];
+            let i_filtered = upstream_mul_add(num.x, i_sample, zi.x, fused);
+            let q_filtered = upstream_mul_add(num.x, q_sample, zq.x, fused);
+
+            if (filter_len > 1u) {
+                let i_y = upstream_mul_add(num.y, i_sample, zi.y, fused);
+                let q_y = upstream_mul_add(num.y, q_sample, zq.y, fused);
+                zi.x = upstream_mul_add(-den.x, i_filtered, i_y, fused);
+                zq.x = upstream_mul_add(-den.x, q_filtered, q_y, fused);
+            }
+            if (filter_len > 2u) {
+                let i_z = upstream_mul_add(num.z, i_sample, zi.z, fused);
+                let q_z = upstream_mul_add(num.z, q_sample, zq.z, fused);
+                zi.y = upstream_mul_add(-den.y, i_filtered, i_z, fused);
+                zq.y = upstream_mul_add(-den.y, q_filtered, q_z, fused);
+            }
+            if (filter_len > 3u) {
+                let i_w = upstream_mul_add(num.w, i_sample, zi.w, fused);
+                let q_w = upstream_mul_add(num.w, q_sample, zq.w, fused);
+                zi.z = upstream_mul_add(-den.z, i_filtered, i_w, fused);
+                zq.z = upstream_mul_add(-den.z, q_filtered, q_w, fused);
+            }
+
+            if (i >= delay) {
+                let write_idx = row_start + i - delay;
+                i_plane[write_idx] = i_filtered;
+                q_plane[write_idx] = q_filtered;
+            }
+        }
+        return;
+    }
 
     // Matches TransferFunction::initial_condition_into (scipy) for FirstSample, like the CPU path.
     if ((filter_coeffs.initial_condition_mode & 1u) != 0u) {

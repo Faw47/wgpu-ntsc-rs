@@ -42,11 +42,11 @@ The output labels software adapters explicitly. Do not use those timings to
 decide whether the RX 6800 path is worthwhile.
 
 The strict shader path uses integer-emulated binary32 add and multiply-add
-rounding so that the GPU remains within the CPU parity target. For throughput
-experiments, set `NTSC_WGPU_FAST_MATH=1` before starting the process. This
-selects native adapter f32 arithmetic for recursive filters and demodulation.
-Fast math is intentionally not a bit-exact parity mode, and the default is
-unchanged when the variable is absent.
+rounding so that the GPU remains within the CPU parity target. Release builds
+use native adapter f32 arithmetic for throughput by default; set
+`NTSC_WGPU_FAST_MATH=0` to force strict arithmetic. Debug builds remain strict
+unless `NTSC_WGPU_FAST_MATH=1` is set. Native f32 is intentionally not a
+bit-exact parity mode.
 
 The recursive row filter defaults to a 64-thread workgroup. Hardware tuning
 can select `NTSC_WGPU_FILTER_WORKGROUP=32`, `64`, `128`, or `256`; unsupported
@@ -60,12 +60,12 @@ frame. This is useful for separating RGB/YIQ conversion and UI-side copies
 from WGPU work. The setting is sampled once per process and should be disabled
 for normal playback.
 
-The preview can also opt into adapter-side YIQ-to-RGBA8 conversion with
-`NTSC_WGPU_DIRECT_RGBA8=1`. This path is intentionally narrow: it applies only
-to progressive, tightly packed 8-bit previews using a full-frame `Both` field.
-Fielded, cropped, split-screen, and high-bit-depth output continue through the
-general CPU write path so their semantics do not change. If automatic backend
-selection cannot create WGPU, the preview retries through its normal CPU path.
+The preview uses adapter-side YIQ-to-RGBA8 conversion by default when the frame
+is progressive, tightly packed, 8-bit, and uses a full-frame `Both` field. Set
+`NTSC_WGPU_DIRECT_RGBA8=0` to force the general path. Fielded, cropped,
+split-screen, and high-bit-depth output continue through the general CPU write
+path so their semantics do not change. If automatic backend selection cannot
+create WGPU, the preview retries through its normal CPU path.
 
 Library integrations that own their frame queue can use
 `WgpuBackend::apply_effect_async` to submit an effect and enqueue its readback
@@ -92,12 +92,11 @@ is set. It covers progressive and interlaced frames at 480p, 720p, 1080p, and
 driver, resolution, and whether the run used the production row filter before
 making an architectural decision.
 
-Automatic backend selection intentionally keeps the CPU reference on integrated
-adapters for this synchronous YIQ API. The measured frame includes upload,
-compute, readback, and mapping, so an integrated adapter can be slower than the
-multithreaded CPU path even when its compute dispatch is healthy. Set
-`NTSC_WGPU_AUTO_INTEGRATED=1` to test automatic WGPU selection on an integrated
-adapter, or request explicit WGPU when validating the adapter directly.
+Automatic backend selection uses any hardware adapter, including integrated
+GPUs. The measured frame includes upload, compute, readback, and mapping, so an
+integrated adapter can still be slower than the multithreaded CPU path even when
+its compute dispatch is healthy. Request explicit WGPU when validating an
+adapter directly.
 
 The parity gate also prints WGPU host stages for each progressive and
 interlaced sample: independent control preparation, command encoding, and queue
