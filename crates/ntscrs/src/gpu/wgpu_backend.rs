@@ -1970,21 +1970,49 @@ impl WgpuBackend {
             ntsc::{NTSC_RATE, make_lowpass_for_type},
             settings::standard::ChromaLowpass,
         };
-        let cuts = match mode {
-            ChromaLowpass::None => return,
-            ChromaLowpass::Light => [(2_600_000.0, 1), (2_600_000.0, 1)],
-            ChromaLowpass::Full => [(1_300_000.0, 2), (600_000.0, 4)],
-        };
-        for (cutoff, delay) in cuts {
-            let filter = make_lowpass_for_type(cutoff, NTSC_RATE * scale, filter_type);
-            self.dispatch_filter_planes(
-                encoder,
-                frame,
-                params,
-                &filter,
-                false,
-                delay,
-            );
+        match mode {
+            ChromaLowpass::None => {}
+            // Light low-pass uses identical I/Q transfer functions, so the
+            // production path can fuse them into one dispatch.
+            ChromaLowpass::Light => {
+                let filter =
+                    make_lowpass_for_type(2_600_000.0, NTSC_RATE * scale, filter_type);
+                self.dispatch_filter_planes(
+                    encoder,
+                    frame,
+                    params,
+                    &filter,
+                    false,
+                    1,
+                );
+            }
+            // Full low-pass intentionally uses different I and Q cutoffs.
+            // Keep these filters separate; applying the I coefficients to Q
+            // changes the effect rather than merely changing dispatch shape.
+            ChromaLowpass::Full => {
+                let i_filter =
+                    make_lowpass_for_type(1_300_000.0, NTSC_RATE * scale, filter_type);
+                let q_filter =
+                    make_lowpass_for_type(600_000.0, NTSC_RATE * scale, filter_type);
+                self.dispatch_filter_plane(
+                    encoder,
+                    frame,
+                    params,
+                    &i_filter,
+                    false,
+                    2,
+                    1,
+                );
+                self.dispatch_filter_plane(
+                    encoder,
+                    frame,
+                    params,
+                    &q_filter,
+                    false,
+                    4,
+                    2,
+                );
+            }
         }
     }
 
