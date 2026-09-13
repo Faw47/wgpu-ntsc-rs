@@ -2,7 +2,7 @@ use crate::{
     gpu::{GpuBackend, GpuFrame},
     noise_seeds,
     settings::standard::{ChromaDemodulationFilter, NtscEffect},
-    yiq_fielding::YiqView,
+    yiq_fielding::{YiqField, YiqView},
 };
 
 use std::{
@@ -254,6 +254,7 @@ pub struct WgpuFrame {
     pub width: usize,
     pub height: usize,
     pub full_height: usize,
+    field: YiqField,
     // Keep reference to the device/queue to easily do readbacks
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
@@ -793,6 +794,7 @@ impl WgpuBackend {
             (frame.width, frame.height)
         );
         frame.full_height = src.dimensions.1;
+        frame.field = src.field;
         self.queue
             .write_buffer(&frame.y_buffer, 0, bytemuck::cast_slice(src.y));
         self.queue
@@ -1600,7 +1602,7 @@ impl WgpuBackend {
         self.block_filter_auto
     }
 
-    fn block_filter_for_effect(&self, effect: &NtscEffect) -> bool {
+    fn block_filter_for_frame(&self, frame: &WgpuFrame) -> bool {
         if !self.block_filter {
             return false;
         }
@@ -1608,7 +1610,12 @@ impl WgpuBackend {
             return true;
         }
 
-        let progressive = !effect.use_field.interlaced_output_allowed();
+        // The uploaded YIQ view is authoritative. A `Both` view is a
+        // progressive/full-frame submission; Upper/Lower views are fielded
+        // submissions. Do not infer this from NtscEffect::use_field because
+        // callers may reuse the default interlaced effect for a progressive
+        // frame (as the diagnostics and preview paths do).
+        let progressive = matches!(frame.field, YiqField::Both);
         !(progressive
             && self.adapter_info.backend == wgpu::Backend::Metal
             && self.adapter_info.device_type == wgpu::DeviceType::IntegratedGpu)
@@ -2319,6 +2326,7 @@ impl GpuBackend for WgpuBackend {
             width: src.dimensions.0,
             height: src.num_rows(),
             full_height: src.dimensions.1,
+            field: src.field,
             device: self.device.clone(),
             queue: self.queue.clone(),
             runtime_errors: self.runtime_errors.clone(),
@@ -2359,7 +2367,7 @@ impl WgpuBackend {
         self.dispatch_stages.borrow_mut().clear();
         self.cpu_control_stages.borrow_mut().clear();
         self.active_block_filter
-            .set(self.block_filter_for_effect(effect));
+            .set(self.block_filter_for_frame(frame));
         use super::prepare;
         let size = (frame.width * frame.height * std::mem::size_of::<f32>()) as u64;
         let mut ring_idx = 0;
