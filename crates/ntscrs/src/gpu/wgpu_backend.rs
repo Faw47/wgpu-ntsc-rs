@@ -246,7 +246,9 @@ pub struct WgpuFrame {
     pub q_pass_bind_group: wgpu::BindGroup,
     pub chroma_loss_bind_group: wgpu::BindGroup,
     block_data_bind_group: Option<wgpu::BindGroup>,
+    #[allow(dead_code)]
     block_summary: Option<wgpu::Buffer>,
+    #[allow(dead_code)]
     block_boundaries: Option<wgpu::Buffer>,
     block_capacity: u32,
     pub width: usize,

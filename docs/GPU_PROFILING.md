@@ -1,9 +1,9 @@
 # GPU profiling runbook
 
-The GPU backend is currently an opt-in implementation and the correctness suite
-must pass before timing it. A run on Mesa llvmpipe is useful for exercising the
-adapter-backed path, but it is a software run and must not be presented as GPU
-performance.
+The GPU backend is the production hardware path when `gpu-wgpu` is enabled, and
+the correctness suite must pass before timing it. A run on Mesa llvmpipe is
+useful for exercising the adapter-backed path, but it is a software run and
+must not be presented as GPU performance.
 
 ## Correctness gate
 
@@ -54,6 +54,13 @@ values or sizes beyond the adapter limit fall back to 64. This changes only
 dispatch shape, not filter arithmetic, and must be benchmarked on the target
 adapter.
 
+Release fast math also enables the production affine block filter for supported
+low-order filters (the default Butterworth path). It decomposes each row into
+64-sample blocks, propagates incoming states, and replays the blocks in
+parallel; identical or distinct I/Q filters can share the same three passes.
+Set `NTSC_WGPU_BLOCK_FILTER=0` to disable it for an A/B run. Debug builds keep
+the strict serial filter unless `NTSC_WGPU_FAST_MATH=1` is explicitly set.
+
 For the desktop preview path, `NTSC_GPU_PROFILE_HOST=1` logs the CPU input
 conversion, backend call, output conversion, and total time for each processed
 frame. This is useful for separating RGB/YIQ conversion and UI-side copies
@@ -89,7 +96,7 @@ cargo bench -p ntsc-rs --features gpu-wgpu --bench backend_profile
 The benchmark refuses a software adapter unless `NTSC_ALLOW_SOFTWARE_GPU=1`
 is set. It covers progressive and interlaced frames at 480p, 720p, 1080p, and
 4K, including preparation, upload, compute, and readback. Record the adapter,
-driver, resolution, and whether the run used the production row filter before
+driver, resolution, and whether fast math/block filtering were enabled before
 making an architectural decision.
 
 Automatic backend selection uses any hardware adapter, including integrated
@@ -105,24 +112,26 @@ prepared concurrently; the stage-level parity test keeps their generated data
 identical to the serial helpers. Use a physical adapter run to decide whether
 the extra host parallelism offsets its allocation cost on the target workload.
 
-## Experimental block filter
+## Standalone block-filter experiment
 
-`gpu::block_filter` is isolated from normal rendering. It demonstrates
+`gpu::block_filter` remains a standalone comparison harness. It demonstrates
 affine-state block propagation for a representative low-order IIR and includes
-CPU and WGPU parity tests. It is not enabled in the production pipeline:
+CPU and WGPU parity tests; the production runner now has its own reusable block
+implementation described above:
 
 ```bash
 cargo test -p ntsc-rs --features gpu-wgpu --test block_filter \
   -- --include-ignored
 ```
 
-The formulation changes floating-point operation ordering. It must therefore
-be compared against the reference at every supported width, delay, filter
-coefficient set, and target adapter before it can replace the current path.
+The standalone formulation changes floating-point operation ordering. Compare
+it against the reference at every supported width, delay, filter coefficient
+set, and target adapter when experimenting with alternate block sizes.
 The design follows the boundary-state/prefix approach described by
 [gpufilter](https://github.com/andmax/gpufilter), without claiming parity or
 performance from that project.
 
-Until a physical RX 6800 (or another target adapter) supplies timings, keep
-the current production row filter and report software-adapter results as
-correctness evidence only.
+Until a physical RX 6800 (or another target adapter) supplies timings, report
+software-adapter results as correctness evidence only. The production fast
+path is enabled for throughput, but its speedup still must be measured on the
+target hardware.

@@ -155,6 +155,14 @@ The live path is `lib.rs::apply_effect_to_yiq_with_backend_preference` -> thread
 
 Device, pipelines, parameter buffers, filter bind groups, control-data buffers, frame buffers and staging buffers are persistent/reused. Each active field records the complete effect chain into one compute command buffer and submits once. Readback is a second submission. Interleaved fields use two independent `WgpuFrame` slots, enqueue both readbacks before the first blocking poll, and preserve the upstream doubled field timebase.
 
+Release WGPU execution uses native f32 arithmetic and enables the production
+64-sample affine block filter for supported low-order filters. The block pass
+summarizes zero-state blocks, propagates row boundaries, and replays samples in
+parallel; its paired mode supports both identical and distinct I/Q coefficients
+and delays. `NTSC_WGPU_FAST_MATH=0` selects the strict host-rounding path, while
+`NTSC_WGPU_BLOCK_FILTER=0` disables block decomposition for controlled A/B
+measurements. Debug builds remain strict unless fast math is explicitly enabled.
+
 Y, I, and Q scratch and staging storage are separate buffers and bindings. This removes the old single-binding requirement of three planes at once without changing plane indexing or effect order. Before allocation, checked arithmetic computes per-plane bytes, total bytes, storage binding size, buffer size, row-control capacity, and dispatch bounds. Initialization records adapter maximums, requests the relevant adapter-supported storage/buffer limits, and records actual device limits separately. Unsupported dimensions return `UnsupportedCapacity` or `SizeOverflow`; WGPU validation panics are not the normal capacity failure path. An explicit WGPU request returns that error without invoking the CPU image-effect entry point. Auto may fall back for initialization or capacity, retaining the reason.
 
 This is field-level overlap, not a two-frame export ring. The caller's YIQ-to-RGB conversion and GStreamer/encoder handoff begin only after `finish_download` returns. No cross-frame in-flight ownership contract exists in the shared entry point.
@@ -263,6 +271,7 @@ Still hardware-gated:
 | Cross-frame export ring | `MEASURE_FIRST` | Requires stage timings and an asynchronous ownership API above the current sync boundary. |
 | GPU-resident preview | `MEASURE_FIRST` plus architecture blocker | Requires display interop design and per-platform feasibility, not just a shader. |
 | Filter coefficient/cache changes | `MEASURE_FIRST` | Record coefficient-build time, cache hits, and eviction under real settings changes. |
+| Native-f32 affine block IIR filters | `DO_NOW` | Production release path is enabled for low-order filters and retains strict serial fallback; parity is covered by the fast GPU golden gate. |
 | Workgroup size changes or pass fusion | `MEASURE_FIRST` | Require adapter-attributed GPU timestamp and end-to-end measurements. |
 | Per-pixel independent RNG, reordered event streams, FIR approximation, reduced-resolution effects | `REJECT` | Changes upstream sequences, correlations, filters, or visible output. |
 
@@ -312,7 +321,10 @@ Initialization failure is represented before processing. Post-device-creation va
 
 ## Performance Benchmark Contract
 
-No performance benchmark was run in this implementation pass, and no historical software-Vulkan number is used as evidence.
+Hosted software Vulkan runs are correctness gates, not acceleration evidence.
+Physical adapter measurements remain required for any speedup claim; the
+release benchmark now exercises native f32 plus the production block filter by
+default and reports the adapter identity so those runs are reproducible.
 
 Use `cargo bench -p ntsc-rs --features gpu-wgpu --bench backend_profile` only with the exact adapter name, backend, device type, driver, OS, settings, input and resolution recorded. CPU WGPU adapters may validate correctness but cannot support acceleration claims.
 
