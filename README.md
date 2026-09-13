@@ -59,9 +59,12 @@ NTSC_WGPU_DIRECT_RGBA8=1 cargo run -p ntsc-rs-gui --release
 
 `NTSC_WGPU_FAST_MATH` is not a bit-exact mode. `NTSC_GPU_PROFILE_HOST=1` adds per-frame input conversion,
 backend, output conversion, and total timing to the desktop preview log.
-Release fast math also enables the production 64-sample block-IIR filter for
-low-order filters, including distinct I/Q full-chroma filters. Set
-`NTSC_WGPU_BLOCK_FILTER=0` for a controlled A/B comparison.
+Release fast math enables the production 64-sample block-IIR filter for
+low-order filters, including distinct I/Q full-chroma filters. Automatic mode
+uses it on discrete GPUs and interlaced work, while integrated Metal GPUs use
+the faster serial row kernel for progressive frames at this shape. Set
+`NTSC_WGPU_BLOCK_FILTER=1` to force blocks, `=0` to disable them, or `=auto`
+for the default hardware-aware selection.
 `NTSC_WGPU_DIRECT_RGBA8` is a narrow preview optimization for tightly packed
 progressive 8-bit `Both` frames; fielded, cropped, and high-bit-depth output
 keep the general path.
